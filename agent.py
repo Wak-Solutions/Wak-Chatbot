@@ -234,18 +234,6 @@ async def get_reply(customer_phone: str, new_message: str) -> str:
         # complaints, product inquiries, etc.
         final_reply = response_message.content
 
-    # Notify dashboard of the new outbound message
-    await notify_dashboard(
-        event="message",
-        customer_phone=customer_phone,
-        message_text=final_reply,
-    )
-
-    await database.create_escalation(
-        customer_phone=customer_phone,
-        escalation_reason="Active conversation",
-    )
-
     # Step 6: Save the exchange to memory
     # Save both the customer's message and the bot's reply to the
     # messages table so future calls have accurate history.
