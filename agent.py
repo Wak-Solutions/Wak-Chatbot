@@ -4,7 +4,7 @@ import openai
 
 import database
 import memory
-from config import DASHBOARD_URL, OPENAI_API_KEY, OPENAI_MODEL, WEBHOOK_SECRET
+from config import DASHBOARD_URL, OPENAI_API_KEY, OPENAI_MODEL, WEBHOOK_SECRET, DATABASE_URL
 
 # Initialise the OpenAI client with your API key.
 # This client is reused for every call - no need to recreate it each time.
@@ -54,7 +54,7 @@ async def notify_dashboard(
 # role "system". It defines the bot's identity, language behaviour,
 # menu structure, and all rules. OpenAI treats system messages as
 # the highest priority instructions.
-SYSTEM_PROMPT = """
+DEFAULT_SYSTEM_PROMPT = """
 You are a professional customer service assistant for WAK Solutions, a company specializing in AI and robotics solutions. You communicate in whatever language the customer uses - Arabic, English, Chinese, or any other language.
 
 STEP 0 - Opening Message
@@ -93,6 +93,32 @@ Rules:
 - Any dead end or escalation -> politely close with "A member of our team will be in touch shortly"
 - This WhatsApp chat is for WAK Solutions customer service only. If a customer requests unrelated help, politely decline and redirect them to the menu. If they repeatedly try to misuse the chat, end the conversation politely with "A member of our team will be in touch shortly"
 """.strip()
+
+
+_cached_prompt: str | None = None
+
+
+async def get_system_prompt() -> str:
+    """Return the active system prompt from DB, falling back to the default."""
+    global _cached_prompt
+    if _cached_prompt is not None:
+        return _cached_prompt
+    try:
+        import asyncpg
+        conn = await asyncpg.connect(DATABASE_URL)
+        row = await conn.fetchrow("SELECT system_prompt FROM chatbot_config ORDER BY id LIMIT 1")
+        await conn.close()
+        if row:
+            _cached_prompt = row["system_prompt"]
+            return _cached_prompt
+    except Exception as e:
+        print(f"[agent] Could not load system prompt from DB: {e}", flush=True)
+    return DEFAULT_SYSTEM_PROMPT
+
+
+def invalidate_prompt_cache() -> None:
+    global _cached_prompt
+    _cached_prompt = None
 
 
 # This tells OpenAI what tools are available to it.
@@ -161,7 +187,7 @@ async def get_reply(customer_phone: str, new_message: str) -> str:
     # Step 2: Build the message list
     # The system prompt always comes first - it frames everything after it.
     messages = (
-        [{"role": "system", "content": SYSTEM_PROMPT}]  # system prompt first
+        [{"role": "system", "content": await get_system_prompt()}]  # system prompt first
         + history  # past conversation
         + [{"role": "user", "content": new_message}]  # customer's new message
     )
