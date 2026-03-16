@@ -136,6 +136,14 @@ def _is_resolved(reply: str) -> bool:
     return any(phrase in lower for phrase in _RESOLUTION_PHRASES)
 
 
+_MEETING_KEYWORDS = ["meeting", "book", "schedule", "appointment", "slot", "call"]
+
+
+def _wants_meeting(message: str) -> bool:
+    lower = message.lower()
+    return any(kw in lower for kw in _MEETING_KEYWORDS)
+
+
 # This tells OpenAI what tools are available to it.
 # It's a list because you can define multiple tools - we only need one.
 #
@@ -230,6 +238,31 @@ async def get_reply(customer_phone: str, new_message: str) -> tuple[str, str | N
     # Step 2: Check if a pending meeting already exists so we don't
     # send a second booking link for the same conversation.
     pending_meeting = await database.get_pending_meeting(customer_phone)
+
+    # Bug 2 fix: if the customer is asking about a meeting and already has
+    # an unbooked pending meeting, skip OpenAI and resend the booking link.
+    if (
+        _wants_meeting(new_message)
+        and pending_meeting
+        and pending_meeting.get("scheduled_at") is None
+    ):
+        token = pending_meeting.get("meeting_token")
+        if token:
+            booking_url = f"{DASHBOARD_URL}/book/{token}"
+            booking_reply = (
+                f"You can book your preferred time slot here: {booking_url}"
+            )
+            await memory.save_message(
+                customer_phone=customer_phone,
+                direction="inbound",
+                message_text=new_message,
+            )
+            await memory.save_message(
+                customer_phone=customer_phone,
+                direction="outbound",
+                message_text=booking_reply,
+            )
+            return booking_reply, None
 
     # Step 3: Build the message list.
     system_content = await get_system_prompt()
@@ -326,20 +359,32 @@ async def get_reply(customer_phone: str, new_message: str) -> tuple[str, str | N
         message_text=final_reply,
     )
 
-    # Step 7: If the conversation was just resolved and no pending meeting
-    # exists yet, create a booking token and send the customer a link to
-    # choose their preferred time slot.
+    # Step 7: If the conversation was just resolved, send the customer a
+    # booking link. If an unbooked pending meeting already exists, resend
+    # its token (Bug 1 fix). Otherwise create a fresh one.
     meeting_message: str | None = None
-    if _is_resolved(final_reply) and not pending_meeting:
-        try:
-            token = await database.create_meeting_with_token(customer_phone)
-            booking_url = f"{DASHBOARD_URL}/book/{token}"
-            meeting_message = (
-                f"Thank you for contacting WAK Solutions! Would you like to schedule a "
-                f"video meeting with one of our team? Book your preferred time here: "
-                f"{booking_url}"
-            )
-        except Exception as e:
-            print(f"[agent] Failed to create meeting token: {e}", flush=True)
+    if _is_resolved(final_reply):
+        if pending_meeting and pending_meeting.get("scheduled_at") is None:
+            # Unbooked meeting already exists — resend the existing booking URL.
+            token = pending_meeting.get("meeting_token")
+            if token:
+                booking_url = f"{DASHBOARD_URL}/book/{token}"
+                meeting_message = (
+                    f"Thank you for contacting WAK Solutions! Would you like to schedule a "
+                    f"video meeting with one of our team? Book your preferred time here: "
+                    f"{booking_url}"
+                )
+        elif not pending_meeting:
+            # No meeting yet — create a new booking token.
+            try:
+                token = await database.create_meeting_with_token(customer_phone)
+                booking_url = f"{DASHBOARD_URL}/book/{token}"
+                meeting_message = (
+                    f"Thank you for contacting WAK Solutions! Would you like to schedule a "
+                    f"video meeting with one of our team? Book your preferred time here: "
+                    f"{booking_url}"
+                )
+            except Exception as e:
+                print(f"[agent] Failed to create meeting token: {e}", flush=True)
 
     return final_reply, meeting_message

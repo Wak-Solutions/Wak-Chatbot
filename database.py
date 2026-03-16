@@ -120,11 +120,13 @@ async def create_meeting_with_token(customer_phone: str) -> str:
 async def get_pending_meeting(customer_phone: str) -> dict | None:
     """
     Returns the latest pending meeting for a customer, or None.
+    Includes meeting_token and scheduled_at so agent.py can resend
+    the booking URL if the meeting is still unbooked (scheduled_at IS NULL).
     """
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-            SELECT id, meeting_link, agreed_time
+            SELECT id, meeting_link, agreed_time, meeting_token, scheduled_at
             FROM meetings
             WHERE customer_phone = $1 AND status = 'pending'
             ORDER BY created_at DESC
@@ -138,6 +140,8 @@ async def get_pending_meeting(customer_phone: str) -> dict | None:
         "id": row["id"],
         "meeting_link": row["meeting_link"],
         "agreed_time": row["agreed_time"],
+        "meeting_token": row["meeting_token"],
+        "scheduled_at": row["scheduled_at"],
     }
 
 
