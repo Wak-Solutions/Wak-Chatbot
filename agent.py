@@ -248,17 +248,33 @@ async def get_reply(customer_phone: str, new_message: str) -> tuple[str, str | N
 
     # Bug 2 fix: if the customer is asking about a meeting and already has
     # an unbooked pending meeting, skip OpenAI and resend the booking link.
-    if (
-        _wants_meeting(new_message)
-        and pending_meeting
-        and pending_meeting.get("scheduled_at") is None
-    ):
-        token = pending_meeting.get("meeting_token")
-        if token:
-            booking_url = f"{DASHBOARD_URL}/book/{token}"
-            booking_reply = (
-                f"Here's your personal booking link — valid for 24 hours: {booking_url}"
-            )
+    if _wants_meeting(new_message):
+        booking_url = None
+        if pending_meeting and pending_meeting.get("scheduled_at") is None:
+            # Unbooked meeting already exists — reuse its token.
+            token = pending_meeting.get("meeting_token")
+            if token:
+                booking_url = f"{DASHBOARD_URL}/book/{token}"
+        elif not pending_meeting:
+            # Customer just agreed to a meeting — create a fresh token.
+            try:
+                async with httpx.AsyncClient() as http:
+                    resp = await http.post(
+                        f"{DASHBOARD_URL}/api/meetings/create-token",
+                        json={"customer_phone": customer_phone},
+                        headers={"x-webhook-secret": WEBHOOK_SECRET},
+                        timeout=10.0,
+                    )
+                    resp.raise_for_status()
+                    token = resp.json()["token"]
+                booking_url = f"{DASHBOARD_URL}/book/{token}"
+            except Exception as e:
+                import traceback
+                print(f"[agent] create-token failed: {e}", flush=True)
+                print(traceback.format_exc(), flush=True)
+
+        if booking_url:
+            booking_reply = f"Here's your personal booking link — valid for 24 hours: {booking_url}"
             await memory.save_message(
                 customer_phone=customer_phone,
                 direction="inbound",
@@ -366,51 +382,4 @@ async def get_reply(customer_phone: str, new_message: str) -> tuple[str, str | N
         message_text=final_reply,
     )
 
-    # Step 7: If the conversation was just resolved, send the customer a
-    # booking link. If an unbooked pending meeting already exists, resend
-    # its token (Bug 1 fix). Otherwise create a fresh one.
-    meeting_message: str | None = None
-    print(f"[DEBUG step7] _is_resolved={_is_resolved(final_reply)} pending_meeting={pending_meeting}", flush=True)
-    if _is_resolved(final_reply):
-        if pending_meeting and pending_meeting.get("scheduled_at") is None:
-            token = pending_meeting.get("meeting_token")
-            if not token:
-                # Stale row with no token — delete it and create a fresh one.
-                print(f"[DEBUG step7] Stale meeting (no token), deleting id={pending_meeting['id']}", flush=True)
-                async with database.pool.acquire() as _conn:
-                    await _conn.execute("DELETE FROM meetings WHERE id = $1", pending_meeting["id"])
-                pending_meeting = None  # fall through to create new below
-            else:
-                # Unbooked meeting already exists — resend the existing booking URL.
-                print(f"[DEBUG step7] Resending existing token={token}", flush=True)
-                booking_url = f"{DASHBOARD_URL}/book/{token}"
-                meeting_message = (
-                    f"Here's your personal booking link — valid for 24 hours: {booking_url}"
-                )
-        if not pending_meeting:
-            # No meeting yet — call the dashboard endpoint to create a new booking token.
-            print(f"[DEBUG step7] No pending meeting — calling /api/meetings/create-token", flush=True)
-            try:
-                async with httpx.AsyncClient() as http:
-                    resp = await http.post(
-                        f"{DASHBOARD_URL}/api/meetings/create-token",
-                        json={"customer_phone": customer_phone},
-                        headers={"x-webhook-secret": WEBHOOK_SECRET},
-                        timeout=10.0,
-                    )
-                    resp.raise_for_status()
-                    token = resp.json()["token"]
-                print(f"[DEBUG step7] create-token returned token={token}", flush=True)
-                booking_url = f"{DASHBOARD_URL}/book/{token}"
-                meeting_message = (
-                    f"Here's your personal booking link — valid for 24 hours: {booking_url}"
-                )
-            except Exception as e:
-                import traceback
-                print(f"[DEBUG step7] /api/meetings/create-token FAILED: {e}", flush=True)
-                print(traceback.format_exc(), flush=True)
-        else:
-            print(f"[DEBUG step7] Pending meeting already booked (scheduled_at={pending_meeting.get('scheduled_at')}) — skipping", flush=True)
-    print(f"[DEBUG step7] meeting_message={meeting_message!r}", flush=True)
-
-    return final_reply, meeting_message
+    return final_reply, None
