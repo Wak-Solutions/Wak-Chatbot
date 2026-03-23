@@ -280,8 +280,8 @@ async def get_reply(customer_phone: str, new_message: str) -> tuple[str, str | N
             token = pending_meeting.get("meeting_token")
             if token:
                 booking_url = f"{DASHBOARD_URL}/book/{token}"
-        elif not pending_meeting:
-            # Customer just agreed to a meeting — create a fresh token.
+        elif not pending_meeting or pending_meeting.get("scheduled_at") is not None:
+            # No pending meeting, or the existing one is already booked — create a fresh token.
             try:
                 async with httpx.AsyncClient() as http:
                     resp = await http.post(
