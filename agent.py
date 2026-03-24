@@ -393,6 +393,31 @@ async def get_reply(customer_phone: str, new_message: str) -> tuple[str, str | N
         # complaints, product inquiries, etc.
         final_reply = response_message.content
 
+    # Safety net: if OpenAI left a [Booking Link] placeholder, replace it
+    # with the real URL so customers get a clickable link.
+    if final_reply and "[Booking Link]" in final_reply:
+        print("[agent] AI output [Booking Link] placeholder — replacing with real URL", flush=True)
+        link_url = None
+        if pending_meeting and pending_meeting.get("scheduled_at") is None:
+            token = pending_meeting.get("meeting_token")
+            if token:
+                link_url = f"{DASHBOARD_URL}/book/{token}"
+        if not link_url:
+            try:
+                async with httpx.AsyncClient() as http:
+                    resp = await http.post(
+                        f"{DASHBOARD_URL}/api/meetings/create-token",
+                        json={"customer_phone": customer_phone},
+                        headers={"x-webhook-secret": WEBHOOK_SECRET},
+                        timeout=10.0,
+                    )
+                    resp.raise_for_status()
+                    link_url = f"{DASHBOARD_URL}/book/{resp.json()['token']}"
+            except Exception as e:
+                print(f"[agent] create-token failed in [Booking Link] replacement: {e}", flush=True)
+        if link_url:
+            final_reply = final_reply.replace("[Booking Link]", link_url)
+
     # Safety net: if OpenAI tried to collect a date/time manually, override
     # with the booking link instead. The customer picks their slot on the page.
     if _ai_scheduling_manually(final_reply):
