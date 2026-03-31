@@ -1,31 +1,25 @@
 """
-Voice note handling: download audio from Meta's CDN, transcribe with Whisper.
-
-Called by main.py when a WhatsApp webhook delivers a message with type "audio".
+transcribe.py — download WhatsApp voice notes and transcribe with Whisper.
 """
+
 import logging
 from io import BytesIO
 
 import httpx
 from openai import AsyncOpenAI
 
-from config import WHATSAPP_TOKEN, OPENAI_API_KEY
+from config import OPENAI_API_KEY, WHATSAPP_TOKEN
 
 logger = logging.getLogger(__name__)
 
-# Meta Graph API version for media download.
-# Kept separate from the messaging version in whatsapp.py so each
-# can be bumped independently if Meta deprecates one.
 _GRAPH_VERSION = "v21.0"
 
-# Whisper API hard limit is 25 MB. WhatsApp's own limit for voice
-# notes is 16 MB, so we'll never hit 25 MB — but we reject anything
-# above 20 MB as a safety margin to avoid a confusing Whisper error.
+# Whisper hard limit is 25 MB. WhatsApp's own limit for voice notes is 16 MB,
+# so we'll never hit 25 MB — we reject at 20 MB as a safety margin.
 _MAX_AUDIO_BYTES = 20 * 1024 * 1024  # 20 MB
 
 _openai = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
-# Map WhatsApp / Meta MIME types to the file extensions Whisper accepts.
 _MIME_TO_EXT: dict[str, str] = {
     "audio/ogg": "ogg",
     "audio/ogg; codecs=opus": "ogg",
@@ -41,26 +35,22 @@ _MIME_TO_EXT: dict[str, str] = {
 def _ext(mime_type: str) -> str:
     """Return a Whisper-compatible extension for a given MIME type."""
     base = mime_type.split(";")[0].strip().lower()
-    return _MIME_TO_EXT.get(base, "ogg")  # OGG/Opus is the WhatsApp default
+    return _MIME_TO_EXT.get(base, "ogg")
 
 
 async def download_media(media_id: str) -> tuple[bytes, str]:
     """
     Download a WhatsApp voice note from Meta's CDN.
 
-    Two-step process:
-      1. GET /v21.0/{media_id} → returns the CDN download URL and MIME type.
-      2. GET {cdn_url}         → returns the raw audio bytes.
-
-    Args:
-        media_id: The media ID from the WhatsApp webhook payload.
+    Step 1: GET /v21.0/{media_id} → resolve CDN URL and MIME type.
+    Step 2: GET {cdn_url}         → download raw audio bytes.
 
     Returns:
-        (audio_bytes, mime_type) — raw audio and its MIME type string.
+        (audio_bytes, mime_type)
 
     Raises:
-        ValueError:  If the file is too large for Whisper.
-        httpx.*:     If Meta's API returns an error.
+        ValueError: If the file is too large for Whisper.
+        httpx.*:    If Meta's API returns an error.
     """
     auth_headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}"}
 
@@ -74,18 +64,28 @@ async def download_media(media_id: str) -> tuple[bytes, str]:
         meta_resp.raise_for_status()
         meta = meta_resp.json()
 
-        cdn_url   = meta.get("url")
+        cdn_url = meta.get("url")
         mime_type = meta.get("mime_type", "audio/ogg")
         file_size = meta.get("file_size", 0)
+
+        logger.info(
+            "[INFO] [transcribe] Media metadata — media_id: %s, mime: %s, size_bytes: %s",
+            media_id,
+            mime_type,
+            file_size or "unknown",
+        )
 
         if not cdn_url:
             raise ValueError(f"No CDN URL returned for media_id={media_id}")
 
-        # Reject before downloading if Meta already tells us it's too big
         if file_size and file_size > _MAX_AUDIO_BYTES:
+            logger.warning(
+                "[WARN] [transcribe] Audio too large before download — size_bytes: %d, limit: %d",
+                file_size,
+                _MAX_AUDIO_BYTES,
+            )
             raise ValueError(
-                f"Voice note too large: {file_size:,} bytes "
-                f"(limit {_MAX_AUDIO_BYTES:,} bytes)"
+                f"Voice note too large: {file_size:,} bytes (limit {_MAX_AUDIO_BYTES:,} bytes)"
             )
 
         # Step 2 — download the audio bytes
@@ -98,15 +98,21 @@ async def download_media(media_id: str) -> tuple[bytes, str]:
         audio_resp.raise_for_status()
         audio_bytes = audio_resp.content
 
-    # Double-check after download (Meta's file_size can be absent or wrong)
     if len(audio_bytes) > _MAX_AUDIO_BYTES:
+        logger.warning(
+            "[WARN] [transcribe] Audio too large after download — size_bytes: %d, limit: %d",
+            len(audio_bytes),
+            _MAX_AUDIO_BYTES,
+        )
         raise ValueError(
             f"Voice note too large after download: {len(audio_bytes):,} bytes"
         )
 
     logger.info(
-        "Downloaded media %s — %d bytes, MIME: %s",
-        media_id, len(audio_bytes), mime_type,
+        "[INFO] [transcribe] Audio downloaded — media_id: %s, size_bytes: %d, mime: %s",
+        media_id,
+        len(audio_bytes),
+        mime_type,
     )
     return audio_bytes, mime_type
 
@@ -115,32 +121,51 @@ async def transcribe(audio_bytes: bytes, mime_type: str) -> str:
     """
     Transcribe audio bytes using OpenAI Whisper.
 
-    Whisper automatically detects the language (Arabic, English, etc.) —
-    no language hint needed.
-
-    Args:
-        audio_bytes: Raw audio data.
-        mime_type:   MIME type of the audio (used to name the virtual file
-                     so Whisper knows the format).
+    Whisper automatically detects the language — no language hint needed.
 
     Returns:
-        Stripped transcription string. Empty string if nothing was heard.
+        Stripped transcription string. Empty string if no speech detected.
 
     Raises:
         openai.APIError: On Whisper API failures.
     """
     ext = _ext(mime_type)
+    size_bytes = len(audio_bytes)
 
-    # Whisper expects a file-like object with a .name attribute that
-    # ends in a recognised audio extension.
+    logger.info(
+        "[INFO] [transcribe] Whisper request — model: whisper-1, size_bytes: %d, ext: %s",
+        size_bytes,
+        ext,
+    )
+
     audio_file = BytesIO(audio_bytes)
     audio_file.name = f"voice.{ext}"
 
-    response = await _openai.audio.transcriptions.create(
-        model="whisper-1",
-        file=audio_file,
-    )
+    try:
+        response = await _openai.audio.transcriptions.create(
+            model="whisper-1",
+            file=audio_file,
+        )
+        text = (response.text or "").strip()
 
-    text = (response.text or "").strip()
-    logger.info("Whisper result (%d bytes audio): %r", len(audio_bytes), text[:120])
-    return text
+        if text:
+            logger.info(
+                "[INFO] [transcribe] Whisper success — model: whisper-1, size_bytes: %d, result_chars: %d",
+                size_bytes,
+                len(text),
+            )
+        else:
+            logger.info(
+                "[INFO] [transcribe] Whisper returned empty transcription — model: whisper-1, size_bytes: %d",
+                size_bytes,
+            )
+        return text
+
+    except Exception as exc:
+        logger.error(
+            "[ERROR] [transcribe] Whisper failed — model: whisper-1, size_bytes: %d, error: %s",
+            size_bytes,
+            exc,
+            exc_info=True,
+        )
+        raise

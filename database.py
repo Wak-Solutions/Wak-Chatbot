@@ -1,266 +1,356 @@
-import asyncpg
-import random
-import string
+"""
+database.py — asyncpg connection pool and all SQL query functions.
+"""
+
+import logging
 import uuid
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
+
+import asyncpg
+
 from config import DATABASE_URL
 
+logger = logging.getLogger(__name__)
 
-# This variable holds the pool once it's created.
-# It starts as None — main.py will initialise it on startup.
+# Holds the pool once created by main.py on startup.
 pool: asyncpg.Pool | None = None
 
 
-async def create_pool():
-    """
-    Called once when FastAPI starts up (in main.py).
-    Opens a pool of 2-10 reusable connections to Neon.
+# ---------------------------------------------------------------------------
+# Pool lifecycle
+# ---------------------------------------------------------------------------
 
-    We strip the query parameters from the URL (?sslmode=require...)
-    because asyncpg doesn't support them as URL params — instead we
-    pass ssl="require" as a keyword argument directly.
+
+async def create_pool() -> None:
+    """
+    Opens a pool of 2–10 reusable connections to Neon.
+    Called once on FastAPI startup in main.py.
+    Strips query parameters from the URL because asyncpg doesn't support them.
     """
     global pool
-
-    # Strip query parameters from the Neon URL.
-    # Neon gives you: postgresql://user:pass@host/db?sslmode=require&channel_binding=require
-    # asyncpg needs:  postgresql://user:pass@host/db  (+ ssl handled separately)
     clean_url = DATABASE_URL.split("?")[0]
+    try:
+        pool = await asyncpg.create_pool(
+            dsn=clean_url,
+            ssl="require",
+            min_size=2,
+            max_size=10,
+        )
+        logger.info("[INFO] [database] Connection pool created — min: 2, max: 10")
+    except Exception as exc:
+        logger.error("[ERROR] [database] Failed to create connection pool: %s", exc, exc_info=True)
+        raise
 
-    pool = await asyncpg.create_pool(
-        dsn=clean_url,  # The cleaned connection string
-        ssl="require",  # Neon requires SSL — passed directly to asyncpg
-        min_size=2,     # Keep at least 2 connections open at all times
-        max_size=10,    # Allow up to 10 simultaneous connections under load
-    )
 
-
-async def close_pool():
-    """
-    Called once when FastAPI shuts down (in main.py).
-    Cleanly closes all connections in the pool.
-    Not strictly required but good practice — avoids leaving
-    dangling connections on the Neon side.
-    """
+async def close_pool() -> None:
+    """Cleanly closes all pool connections on FastAPI shutdown."""
     global pool
     if pool:
         await pool.close()
+        logger.info("[INFO] [database] Connection pool closed")
+
+
+# ---------------------------------------------------------------------------
+# Orders
+# ---------------------------------------------------------------------------
 
 
 async def lookup_order(order_number: str) -> dict:
     """
-    Queries the orders table for a given order_number.
+    Query the orders table for a given order_number.
     Called by agent.py when OpenAI triggers the lookup_order tool.
-
-    Returns a dict with the order details, or a not-found message.
-    The result gets sent back to OpenAI so it can write a natural reply.
-
-    Args:
-        order_number: The order number the customer provided.
-
-    Returns:
-        dict: Either the order data, or a message saying it wasn't found.
     """
-    # Acquire a connection from the pool.
-    # The "async with" block automatically returns it to the pool when done.
-    async with pool.acquire() as conn:
-        # $1 is asyncpg's placeholder for the first argument (order_number).
-        # This is parameterised — never use f-strings for SQL, that's how
-        # SQL injection attacks happen. asyncpg handles escaping safely.
-        row = await conn.fetchrow(
-            """
-            SELECT order_number, status, details, created_at
-            FROM orders
-            WHERE order_number = $1
-            """,
-            order_number,  # asyncpg maps this to $1
+    try:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT order_number, status, details, created_at
+                FROM orders
+                WHERE order_number = $1
+                """,
+                order_number,
+            )
+        if row is None:
+            logger.info("[INFO] [database] Order not found — order_number: %s", order_number)
+            return {"found": False, "message": f"No order found with number {order_number}."}
+        logger.info(
+            "[INFO] [database] Order lookup success — order_number: %s, status: %s",
+            order_number,
+            row["status"],
         )
-
-    # fetchrow() returns None if no matching row was found.
-    if row is None:
         return {
-            "found": False,
-            "message": f"No order found with number {order_number}.",
+            "found": True,
+            "order_number": row["order_number"],
+            "status": row["status"],
+            "details": row["details"],
+            "created_at": str(row["created_at"]),
         }
+    except Exception as exc:
+        logger.error(
+            "[ERROR] [database] lookup_order failed — order_number: %s, error: %s",
+            order_number,
+            exc,
+            exc_info=True,
+        )
+        raise
 
-    # Convert the asyncpg Record object to a plain dict.
-    # We also convert created_at to a string so it's JSON-serialisable
-    # (datetime objects can't be sent to OpenAI as-is).
-    return {
-        "found": True,
-        "order_number": row["order_number"],
-        "status": row["status"],
-        "details": row["details"],
-        "created_at": str(row["created_at"]),
-    }
+
+# ---------------------------------------------------------------------------
+# Meetings
+# ---------------------------------------------------------------------------
 
 
 async def create_meeting_with_token(customer_phone: str) -> str:
     """
-    Creates a meeting record with a unique booking token.
-    The Jitsi link is generated later when the customer books a slot.
-    Returns the booking token (UUID).
+    Creates a meeting record with a unique booking token (24 hr expiry).
+    Returns the token UUID string.
     """
     token = str(uuid.uuid4())
     expires_at = datetime.now(timezone.utc) + timedelta(hours=24)
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            INSERT INTO meetings
-              (customer_phone, meeting_link, meeting_token, token_expires_at, status, created_at)
-            VALUES ($1, '', $2, $3, 'pending', NOW())
-            """,
-            customer_phone,
-            token,
-            expires_at,
-        )
-    return token
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO meetings
+                  (customer_phone, meeting_link, meeting_token, token_expires_at, status, created_at)
+                VALUES ($1, '', $2, $3, 'pending', NOW())
+                """,
+                customer_phone,
+                token,
+                expires_at,
+            )
+        logger.info("[INFO] [database] Meeting token created — token: %s", token[:8] + "...")
+        return token
+    except Exception as exc:
+        logger.error("[ERROR] [database] create_meeting_with_token failed: %s", exc, exc_info=True)
+        raise
 
 
 async def get_pending_meeting(customer_phone: str) -> dict | None:
     """
     Returns the latest pending meeting for a customer, or None.
-    Includes meeting_token and scheduled_at so agent.py can resend
-    the booking URL if the meeting is still unbooked (scheduled_at IS NULL).
     """
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            SELECT id, meeting_link, agreed_time, meeting_token, scheduled_at
-            FROM meetings
-            WHERE customer_phone = $1 AND status = 'pending'
-            ORDER BY created_at DESC
-            LIMIT 1
-            """,
-            customer_phone,
+    try:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT id, meeting_link, agreed_time, meeting_token, scheduled_at
+                FROM meetings
+                WHERE customer_phone = $1 AND status = 'pending'
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                customer_phone,
+            )
+        if row is None:
+            return None
+        return {
+            "id": row["id"],
+            "meeting_link": row["meeting_link"],
+            "agreed_time": row["agreed_time"],
+            "meeting_token": row["meeting_token"],
+            "scheduled_at": row["scheduled_at"],
+        }
+    except Exception as exc:
+        logger.error(
+            "[ERROR] [database] get_pending_meeting failed: %s", exc, exc_info=True
         )
-    if row is None:
-        return None
-    return {
-        "id": row["id"],
-        "meeting_link": row["meeting_link"],
-        "agreed_time": row["agreed_time"],
-        "meeting_token": row["meeting_token"],
-        "scheduled_at": row["scheduled_at"],
-    }
+        raise
 
 
 async def update_meeting_time(meeting_id: int, agreed_time: str) -> None:
-    """
-    Saves the date/time the customer agreed to for their pending meeting.
-    """
-    async with pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE meetings SET agreed_time = $1 WHERE id = $2",
-            agreed_time,
+    """Saves the agreed date/time for a pending meeting."""
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE meetings SET agreed_time = $1 WHERE id = $2",
+                agreed_time,
+                meeting_id,
+            )
+        logger.info(
+            "[INFO] [database] Meeting time updated — meeting_id: %d, agreed_time: %s",
             meeting_id,
+            agreed_time,
         )
+    except Exception as exc:
+        logger.error(
+            "[ERROR] [database] update_meeting_time failed — meeting_id: %d, error: %s",
+            meeting_id,
+            exc,
+            exc_info=True,
+        )
+        raise
 
 
 async def get_meetings_to_notify() -> list[dict]:
     """
-    Returns meetings that are within 15 minutes of their scheduled time,
-    have not had their link sent yet, and are not completed.
+    Returns meetings within 15 minutes of start time that haven't had
+    their link sent yet.
     """
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT id, customer_phone, meeting_link, meeting_token
-            FROM meetings
-            WHERE status != 'completed'
-              AND link_sent = FALSE
-              AND meeting_link != ''
-              AND scheduled_at IS NOT NULL
-              AND scheduled_at <= NOW() + INTERVAL '15 minutes'
-              AND scheduled_at >= NOW() - INTERVAL '30 minutes'
-            """
+    try:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, customer_phone, meeting_link, meeting_token
+                FROM meetings
+                WHERE status != 'completed'
+                  AND link_sent = FALSE
+                  AND meeting_link != ''
+                  AND scheduled_at IS NOT NULL
+                  AND scheduled_at <= NOW() + INTERVAL '15 minutes'
+                  AND scheduled_at >= NOW() - INTERVAL '30 minutes'
+                """
+            )
+        result = [dict(r) for r in rows]
+        if result:
+            logger.info(
+                "[INFO] [database] Meetings to notify — count: %d", len(result)
+            )
+        return result
+    except Exception as exc:
+        logger.error(
+            "[ERROR] [database] get_meetings_to_notify failed: %s", exc, exc_info=True
         )
-    return [dict(r) for r in rows]
+        raise
 
 
 async def mark_link_sent(meeting_id: int) -> None:
-    """Marks the Jitsi link as sent so it is not sent again."""
-    async with pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE meetings SET link_sent = TRUE WHERE id = $1",
+    """Marks the meeting link as sent to prevent duplicate delivery."""
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE meetings SET link_sent = TRUE WHERE id = $1",
+                meeting_id,
+            )
+    except Exception as exc:
+        logger.error(
+            "[ERROR] [database] mark_link_sent failed — meeting_id: %d, error: %s",
             meeting_id,
+            exc,
+            exc_info=True,
         )
+        raise
+
+
+# ---------------------------------------------------------------------------
+# Voice notes
+# ---------------------------------------------------------------------------
 
 
 async def store_voice_note(audio_bytes: bytes, mime_type: str) -> str:
     """
     Persist voice note audio in the voice_notes table.
-
-    Storing in the database (rather than on disk) keeps audio durable
-    across restarts on platforms with ephemeral filesystems.
-
-    Returns the UUID string that uniquely identifies this recording.
+    Returns the UUID string that identifies this recording.
     """
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            INSERT INTO voice_notes (audio_data, mime_type)
-            VALUES ($1, $2)
-            RETURNING id::text
-            """,
-            audio_bytes,
+    try:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO voice_notes (audio_data, mime_type)
+                VALUES ($1, $2)
+                RETURNING id::text
+                """,
+                audio_bytes,
+                mime_type,
+            )
+        audio_id = row["id"]
+        logger.info(
+            "[INFO] [database] Voice note stored — id: %s, size_bytes: %d, mime: %s",
+            audio_id[:8] + "...",
+            len(audio_bytes),
             mime_type,
         )
-    return row["id"]
+        return audio_id
+    except Exception as exc:
+        logger.error(
+            "[ERROR] [database] store_voice_note failed — mime: %s, error: %s",
+            mime_type,
+            exc,
+            exc_info=True,
+        )
+        raise
 
 
 async def get_voice_note(audio_id: str) -> dict | None:
     """
     Fetch a voice note by its UUID.
-
-    Returns a dict with keys 'audio_data' (bytes) and 'mime_type',
-    or None if the ID is not found.
+    Returns dict with 'audio_data' and 'mime_type', or None if not found.
     """
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT audio_data, mime_type FROM voice_notes WHERE id = $1::uuid",
+    try:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT audio_data, mime_type FROM voice_notes WHERE id = $1::uuid",
+                audio_id,
+            )
+        if row is None:
+            logger.warning("[WARN] [database] Voice note not found — id: %s", audio_id)
+            return None
+        return {"audio_data": bytes(row["audio_data"]), "mime_type": row["mime_type"]}
+    except Exception as exc:
+        logger.error(
+            "[ERROR] [database] get_voice_note failed — id: %s, error: %s",
             audio_id,
+            exc,
+            exc_info=True,
         )
-    if row is None:
-        return None
-    return {"audio_data": bytes(row["audio_data"]), "mime_type": row["mime_type"]}
+        raise
+
+
+# ---------------------------------------------------------------------------
+# Contacts
+# ---------------------------------------------------------------------------
 
 
 async def auto_capture_contact(customer_phone: str) -> None:
     """
     Upsert a contact row for a customer who just sent an inbound message.
     Does nothing if the number already exists in the contacts table.
-    Called by memory.save_message() for every inbound message so the
-    contacts list grows organically from real WhatsApp conversations.
     """
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            INSERT INTO contacts (phone_number, source)
-            VALUES ($1, 'whatsapp')
-            ON CONFLICT (phone_number) DO NOTHING
-            """,
-            customer_phone,
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO contacts (phone_number, source)
+                VALUES ($1, 'whatsapp')
+                ON CONFLICT (phone_number) DO NOTHING
+                """,
+                customer_phone,
+            )
+    except Exception as exc:
+        logger.error(
+            "[ERROR] [database] auto_capture_contact failed: %s", exc, exc_info=True
         )
+        # Non-fatal — don't raise, just log.
 
 
-async def create_escalation(customer_phone: str, escalation_reason: str):
+# ---------------------------------------------------------------------------
+# Escalations
+# ---------------------------------------------------------------------------
+
+
+async def create_escalation(customer_phone: str, escalation_reason: str) -> None:
     """
     Inserts or updates an escalation record for a customer.
-    Called when the AI sends a handoff phrase.
     Uses ON CONFLICT to avoid duplicates if the customer escalates twice.
     """
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            INSERT INTO escalations (customer_phone, escalation_reason, status, created_at)
-            VALUES ($1, $2, 'open', NOW())
-            ON CONFLICT (customer_phone)
-            DO UPDATE SET
-                escalation_reason = EXCLUDED.escalation_reason,
-                status = 'open',
-                created_at = NOW()
-            """,
-            customer_phone,
-            escalation_reason,
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO escalations (customer_phone, escalation_reason, status, created_at)
+                VALUES ($1, $2, 'open', NOW())
+                ON CONFLICT (customer_phone)
+                DO UPDATE SET
+                    escalation_reason = EXCLUDED.escalation_reason,
+                    status = 'open',
+                    created_at = NOW()
+                """,
+                customer_phone,
+                escalation_reason,
+            )
+        logger.info("[INFO] [database] Escalation created/updated")
+    except Exception as exc:
+        logger.error(
+            "[ERROR] [database] create_escalation failed: %s", exc, exc_info=True
         )
+        raise
