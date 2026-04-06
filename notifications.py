@@ -25,6 +25,7 @@ async def notify_dashboard(
     customer_phone: str,
     message_text: str,
     escalation_reason: str | None = None,
+    company_id: int = 1,
 ) -> None:
     """
     Notify the dashboard of a new message or escalation.
@@ -38,12 +39,14 @@ async def notify_dashboard(
             payload = {
                 "customer_phone": customer_phone,
                 "message_text": message_text,
+                "company_id": company_id,
             }
         elif event == "escalation":
             url = f"{DASHBOARD_URL}/api/escalate"
             payload = {
                 "customer_phone": customer_phone,
                 "escalation_reason": escalation_reason,
+                "company_id": company_id,
             }
         else:
             logger.warning(

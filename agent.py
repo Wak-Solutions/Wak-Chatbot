@@ -39,6 +39,7 @@ client = openai.AsyncOpenAI(api_key=OPENAI_API_KEY)
 async def _resolve_booking_url(
     customer_phone: str,
     pending_meeting: dict | None,
+    company_id: int,
 ) -> str | None:
     """
     Return a booking URL for the customer.
@@ -57,7 +58,7 @@ async def _resolve_booking_url(
         async with httpx.AsyncClient() as http:
             resp = await http.post(
                 f"{DASHBOARD_URL}/api/meetings/create-token",
-                json={"customer_phone": customer_phone},
+                json={"customer_phone": customer_phone, "company_id": company_id},
                 headers={"x-webhook-secret": WEBHOOK_SECRET},
                 timeout=10.0,
             )
@@ -87,6 +88,7 @@ async def get_reply(
     new_message: str,
     *,
     _save_inbound: bool = True,
+    company_id: int = 1,
 ) -> tuple[str, str | None]:
     """
     Main entry point called by main.py for every incoming WhatsApp message.
@@ -110,19 +112,21 @@ async def get_reply(
         _save_inbound:   If False, skip saving the inbound message here.
                          Set to False when the caller (process_audio_message) has
                          already saved it with richer metadata (media_url, etc.).
+        company_id:      The company owning this WhatsApp number.
 
     Returns:
         (reply_text, meeting_message) — meeting_message is always None now;
         kept for backward compat with main.py callers.
     """
     # ── Step 1: Load history ──────────────────────────────────────────────────
-    history = await memory.load_history(customer_phone)
+    history = await memory.load_history(customer_phone, company_id)
 
     # ── Step 2: Notify dashboard (fire-and-forget) ────────────────────────────
     await notify_dashboard(
         event="message",
         customer_phone=customer_phone,
         message_text=new_message,
+        company_id=company_id,
     )
 
     # ── Step 3: Escalation check ──────────────────────────────────────────────
@@ -136,13 +140,14 @@ async def get_reply(
             customer_phone=customer_phone,
             message_text=new_message,
             escalation_reason=new_message,
+            company_id=company_id,
         )
 
     # ── Step 4: Meeting intent short-circuit ──────────────────────────────────
-    pending_meeting = await database.get_pending_meeting(customer_phone)
+    pending_meeting = await database.get_pending_meeting(customer_phone, company_id)
 
     if wants_meeting(new_message, history):
-        booking_url = await _resolve_booking_url(customer_phone, pending_meeting)
+        booking_url = await _resolve_booking_url(customer_phone, pending_meeting, company_id)
         if booking_url:
             booking_reply = (
                 f"Here's your personal booking link — valid for 24 hours: {booking_url}"
@@ -152,11 +157,13 @@ async def get_reply(
                     customer_phone=customer_phone,
                     direction="inbound",
                     message_text=new_message,
+                    company_id=company_id,
                 )
             await memory.save_message(
                 customer_phone=customer_phone,
                 direction="outbound",
                 message_text=booking_reply,
+                company_id=company_id,
             )
             logger.info(
                 "[INFO] [agent] Booking link sent — phone: %s",
@@ -235,7 +242,8 @@ async def get_reply(
 
             if function_name == "lookup_order":
                 tool_result = await database.lookup_order(
-                    order_number=function_args["order_number"]
+                    order_number=function_args["order_number"],
+                    company_id=company_id,
                 )
             elif function_name == "confirm_meeting_time":
                 await database.update_meeting_time(
@@ -290,7 +298,7 @@ async def get_reply(
             "[INFO] [agent] Replacing [BOOKING_LINK] placeholder — phone: %s",
             mask_phone(customer_phone),
         )
-        link_url = await _resolve_booking_url(customer_phone, pending_meeting)
+        link_url = await _resolve_booking_url(customer_phone, pending_meeting, company_id)
         if link_url:
             final_reply = final_reply.replace("[Booking Link]", link_url).replace(
                 "[BOOKING_LINK]", link_url
@@ -302,7 +310,7 @@ async def get_reply(
             "[INFO] [agent] Overriding manual scheduling attempt — phone: %s",
             mask_phone(customer_phone),
         )
-        override_url = await _resolve_booking_url(customer_phone, pending_meeting)
+        override_url = await _resolve_booking_url(customer_phone, pending_meeting, company_id)
         if override_url:
             final_reply = (
                 f"Here's your personal booking link — valid for 24 hours: {override_url}"
@@ -314,11 +322,13 @@ async def get_reply(
             customer_phone=customer_phone,
             direction="inbound",
             message_text=new_message,
+            company_id=company_id,
         )
     await memory.save_message(
         customer_phone=customer_phone,
         direction="outbound",
         message_text=final_reply,
+        company_id=company_id,
     )
 
     return final_reply, None
