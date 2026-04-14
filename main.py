@@ -1,4 +1,7 @@
 import asyncio
+import hashlib
+import hmac
+import json
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -11,7 +14,7 @@ import database
 import memory
 import transcribe as transcribe_mod
 import whatsapp
-from config import VERIFY_TOKEN, WEBHOOK_SECRET
+from config import VERIFY_TOKEN, WEBHOOK_SECRET, WHATSAPP_APP_SECRET
 from notifications import mask_phone
 
 # ---------------------------------------------------------------------------
@@ -86,6 +89,32 @@ app = FastAPI(lifespan=lifespan)
 
 
 # ---------------------------------------------------------------------------
+# Health check — no auth, publicly accessible for Railway and monitors
+# ---------------------------------------------------------------------------
+
+
+@app.get("/health")
+async def health_check():
+    """
+    Returns 200 if the app and database are healthy, 503 if the database
+    is unreachable. Never raises — all errors are caught and reported.
+    """
+    try:
+        async with database.pool.acquire() as conn:
+            await conn.fetchval("SELECT 1")
+        return JSONResponse(
+            content={"status": "ok", "database": "connected"},
+            status_code=200,
+        )
+    except Exception as exc:
+        logger.error("[ERROR] [main] Health check — database unreachable: %s", exc)
+        return JSONResponse(
+            content={"status": "degraded", "database": "unreachable"},
+            status_code=503,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Webhook verification
 # ---------------------------------------------------------------------------
 
@@ -122,7 +151,28 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks):
     Resolves company_id from the WhatsApp phone_number_id in the webhook metadata.
     Falls back to company_id=1 if the phone number is not yet registered.
     """
-    body = await request.json()
+    # ── Signature verification ────────────────────────────────────────
+    # Must read raw bytes BEFORE calling request.json() — parsing first
+    # consumes the body and makes the signature check impossible.
+    raw_body = await request.body()
+
+    signature_header = request.headers.get("X-Hub-Signature-256", "")
+    if not signature_header:
+        logger.warning("[WARN] [main] Webhook POST rejected — missing X-Hub-Signature-256 header")
+        return JSONResponse(content={"error": "Forbidden"}, status_code=403)
+
+    expected_sig = "sha256=" + hmac.new(
+        WHATSAPP_APP_SECRET.encode(),
+        raw_body,
+        hashlib.sha256,
+    ).hexdigest()
+
+    if not hmac.compare_digest(expected_sig, signature_header):
+        logger.warning("[WARN] [main] Webhook POST rejected — signature mismatch")
+        return JSONResponse(content={"error": "Forbidden"}, status_code=403)
+    # ── End signature verification ────────────────────────────────────
+
+    body = json.loads(raw_body)
 
     try:
         entry = body.get("entry", [])

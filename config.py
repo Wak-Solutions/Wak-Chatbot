@@ -47,6 +47,12 @@ VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 DASHBOARD_URL = os.getenv("DASHBOARD_URL")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 
+# App Secret from Meta Developer Console → Your App → App Settings →
+# Basic → App Secret. Used to verify the X-Hub-Signature-256 header on
+# every incoming webhook POST, confirming the request genuinely came
+# from Meta and has not been tampered with.
+WHATSAPP_APP_SECRET = os.getenv("WHATSAPP_APP_SECRET")
+
 
 # ── Memory Settings ───────────────────────────────────────────────────
 
@@ -69,6 +75,7 @@ _required = {
     "VERIFY_TOKEN": VERIFY_TOKEN,
     "DASHBOARD_URL": DASHBOARD_URL,
     "WEBHOOK_SECRET": WEBHOOK_SECRET,
+    "WHATSAPP_APP_SECRET": WHATSAPP_APP_SECRET,
 }
 
 for _name, _value in _required.items():

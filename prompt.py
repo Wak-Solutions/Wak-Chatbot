@@ -12,7 +12,7 @@ import time as _time
 import database
 
 logger = logging.getLogger(__name__)
-
+ 
 # ---------------------------------------------------------------------------
 # Hardcoded default — used when the DB has no config row or is unreachable.
 # ---------------------------------------------------------------------------

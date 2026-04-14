@@ -47,35 +47,62 @@ async def _resolve_booking_url(
     Reuses an existing unbooked meeting token if one exists, otherwise
     creates a fresh token via the dashboard API. Returns None on failure.
     """
-    # Reuse an existing unbooked token if available.
-    if pending_meeting and pending_meeting.get("scheduled_at") is None:
-        token = pending_meeting.get("meeting_token")
-        if token:
-            return f"{DASHBOARD_URL}/book/{token}"
-
-    # Create a new meeting token.
+    # Use a database-level lock to prevent two concurrent instances from both
+    # creating a meeting token for the same customer at the same time.
+    conn = await database.pool.acquire()
     try:
-        async with httpx.AsyncClient() as http:
-            resp = await http.post(
-                f"{DASHBOARD_URL}/api/meetings/create-token",
-                json={"customer_phone": customer_phone, "company_id": company_id},
-                headers={"x-webhook-secret": WEBHOOK_SECRET},
-                timeout=10.0,
+        async with conn.transaction():
+            # Re-check inside the transaction with FOR UPDATE so a second
+            # instance racing here will block until this transaction commits.
+            row = await conn.fetchrow(
+                """
+                SELECT meeting_token
+                FROM meetings
+                WHERE customer_phone = $1
+                  AND company_id     = $2
+                  AND status         = 'pending'
+                  AND scheduled_at   IS NULL
+                  AND created_at     >= NOW() - INTERVAL '5 minutes'
+                ORDER BY created_at DESC
+                LIMIT 1
+                FOR UPDATE
+                """,
+                customer_phone,
+                company_id,
             )
-            resp.raise_for_status()
-            token = resp.json()["token"]
-            logger.info(
-                "[INFO] [agent] Meeting token created — phone: %s",
-                mask_phone(customer_phone),
-            )
-            return f"{DASHBOARD_URL}/book/{token}"
-    except Exception as exc:
-        logger.error(
-            "[ERROR] [agent] create-token failed — phone: %s, error: %s",
-            mask_phone(customer_phone),
-            exc,
-        )
-        return None
+            if row and row["meeting_token"]:
+                # Another instance already created a token — reuse it.
+                logger.info(
+                    "[INFO] [agent] Reusing existing meeting token — phone: %s",
+                    mask_phone(customer_phone),
+                )
+                return f"{DASHBOARD_URL}/book/{row['meeting_token']}"
+
+            # No existing token — create one now.
+            try:
+                async with httpx.AsyncClient() as http:
+                    resp = await http.post(
+                        f"{DASHBOARD_URL}/api/meetings/create-token",
+                        json={"customer_phone": customer_phone, "company_id": company_id},
+                        headers={"x-webhook-secret": WEBHOOK_SECRET},
+                        timeout=10.0,
+                    )
+                    resp.raise_for_status()
+                    token = resp.json()["token"]
+                    logger.info(
+                        "[INFO] [agent] Meeting token created — phone: %s",
+                        mask_phone(customer_phone),
+                    )
+                    return f"{DASHBOARD_URL}/book/{token}"
+            except Exception as exc:
+                logger.error(
+                    "[ERROR] [agent] create-token failed — phone: %s, error: %s",
+                    mask_phone(customer_phone),
+                    exc,
+                )
+                return None
+    finally:
+        await database.pool.release(conn)
 
 
 # ---------------------------------------------------------------------------
