@@ -9,9 +9,7 @@ if the DB is unavailable.
 import logging
 import time as _time
 
-import asyncpg
-
-from config import DATABASE_URL
+import database
 
 logger = logging.getLogger(__name__)
 
@@ -136,12 +134,11 @@ async def get_system_prompt(company_id: int = 1) -> str:
     if cached is not None and (now - cached[1]) < _CACHE_TTL:
         return cached[0]
     try:
-        conn = await asyncpg.connect(DATABASE_URL)
-        row = await conn.fetchrow(
-            "SELECT system_prompt FROM chatbot_config WHERE company_id = $1 ORDER BY id LIMIT 1",
-            company_id,
-        )
-        await conn.close()
+        async with database.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT system_prompt FROM chatbot_config WHERE company_id = $1 ORDER BY id LIMIT 1",
+                company_id,
+            )
         if row and row["system_prompt"]:
             _cache[company_id] = (row["system_prompt"], now)
             logger.info(
