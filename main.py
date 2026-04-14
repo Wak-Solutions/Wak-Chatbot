@@ -39,7 +39,7 @@ async def _link_delivery_loop():
         try:
             meetings = await database.get_meetings_to_notify()
             for m in meetings:
-                raw_base = (os.environ.get("APP_URL") or "wak-agents.up.railway.app").rstrip("/")
+                raw_base = (os.environ.get("APP_URL") or "wak-agent.up.railway.app").rstrip("/")
                 base_url = raw_base if raw_base.startswith("http") else f"https://{raw_base}"
                 meeting_url = (
                     f"{base_url}/meeting/{m['meeting_token']}"
@@ -329,7 +329,7 @@ async def process_audio_message(customer_phone: str, media_id: str, mime_type: s
 
         # Step 2: Store audio in DB
         audio_id = await database.store_voice_note(audio_bytes, actual_mime)
-        raw_base = (os.environ.get("APP_URL") or "wak-agents.up.railway.app").rstrip("/")
+        raw_base = (os.environ.get("APP_URL") or "wak-agent.up.railway.app").rstrip("/")
         base_url = raw_base if raw_base.startswith("http") else f"https://{raw_base}"
         media_url = f"{base_url}/api/voice-notes/{audio_id}"
 

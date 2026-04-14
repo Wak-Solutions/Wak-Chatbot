@@ -230,6 +230,8 @@ async def get_reply(
 
     # ── Step 7: Tool call handling ────────────────────────────────────────────
     if response_message.tool_calls:
+        # Append the assistant message once (contains all tool_calls)
+        messages.append(response_message)
         for tool_call in response_message.tool_calls:
             function_name = tool_call.function.name
             function_args = json.loads(tool_call.function.arguments)
@@ -260,7 +262,6 @@ async def get_reply(
                 )
                 tool_result = {"error": f"Unknown tool: {function_name}"}
 
-            messages.append(response_message)
             messages.append(
                 {
                     "role": "tool",

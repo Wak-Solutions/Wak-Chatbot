@@ -370,7 +370,7 @@ async def auto_capture_contact(customer_phone: str, company_id: int = 1) -> None
                 """
                 INSERT INTO contacts (phone_number, source, company_id)
                 VALUES ($1, 'whatsapp', $2)
-                ON CONFLICT (phone_number) DO NOTHING
+                ON CONFLICT (phone_number, company_id) DO NOTHING
                 """,
                 customer_phone,
                 company_id,
