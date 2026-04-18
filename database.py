@@ -62,14 +62,16 @@ async def close_pool() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def get_company_by_phone_number_id(phone_number_id: str) -> int:
+async def get_company_by_phone_number_id(phone_number_id: str) -> int | None:
     """
     Looks up the company_id that owns this WhatsApp phone_number_id.
     Results are cached in-process so only the first message per process
     triggers a DB round-trip.
 
-    Falls back to company_id = 1 if no match is found (safe during migration
-    while existing companies haven't had their whatsapp_phone_number_id set).
+    Returns None if no active company owns this phone_number_id — the caller
+    must discard the message and log the unroutable event. No fallback to
+    company_id=1: silently routing unmatched messages to a default company
+    causes cross-tenant data leakage.
     """
     if phone_number_id in _company_cache:
         return _company_cache[phone_number_id]
@@ -84,25 +86,31 @@ async def get_company_by_phone_number_id(phone_number_id: str) -> int:
                 """,
                 phone_number_id,
             )
-        company_id = row["id"] if row else 1
         if not row:
-            logger.warning(
-                "[WARN] [database] No company found for phone_number_id %s — falling back to company_id=1",
+            logger.error(
+                "[ERROR] [database] Unroutable webhook — no active company owns phone_number_id=%s. "
+                "Message will be discarded. Register this number in the company's WhatsApp settings.",
                 phone_number_id,
             )
-        else:
-            logger.info(
-                "[INFO] [database] Resolved company_id=%d for phone_number_id=%s",
-                company_id,
-                phone_number_id,
-            )
+            _company_cache[phone_number_id] = None
+            return None
+
+        company_id = row["id"]
+        logger.info(
+            "[INFO] [database] Resolved company_id=%d for phone_number_id=%s",
+            company_id,
+            phone_number_id,
+        )
         _company_cache[phone_number_id] = company_id
         return company_id
     except Exception as exc:
         logger.error(
-            "[ERROR] [database] get_company_by_phone_number_id failed: %s", exc, exc_info=True
+            "[ERROR] [database] get_company_by_phone_number_id failed for phone_number_id=%s: %s",
+            phone_number_id,
+            exc,
+            exc_info=True,
         )
-        return 1  # safe fallback — never crash an inbound message
+        return None  # do not route to a fallback company on DB error
 
 
 # ---------------------------------------------------------------------------

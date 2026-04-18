@@ -187,6 +187,10 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks):
         # Resolve company from the WhatsApp phone_number_id in the webhook metadata.
         phone_number_id = value.get("metadata", {}).get("phone_number_id", "")
         company_id = await database.get_company_by_phone_number_id(phone_number_id)
+        if company_id is None:
+            # Already logged at ERROR level in get_company_by_phone_number_id.
+            # Return 200 so Meta does not retry — retrying won't fix an unregistered number.
+            return JSONResponse(content={"status": "unroutable"}, status_code=200)
 
         message = messages_list[0]
         msg_type = message.get("type")
