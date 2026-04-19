@@ -170,7 +170,8 @@ def build_system_prompt(config: dict) -> str:
       questions  ([{text, answerType, choices}]),
       faq        ([{question, answer}]),
       escalationRules ([{rule}]),
-      menuConfig ([{label, subItems: [str]}])
+      menuConfig ([{label, subItems: [{label, subItems: [str]}]}])
+      Max menu depth: 3 levels (main → sub → sub-sub).
     """
     business_name = config.get("businessName") or "the business"
     industry = config.get("industry") or ""
@@ -206,6 +207,8 @@ def build_system_prompt(config: dict) -> str:
         f'customer\'s language:\n"{greeting}"\nNever skip this step for any reason.'
     )
 
+    _sub_labels = "abcdefghijklmnopqrstuvwxyz"
+
     if menu_items:
         menu_lines = [
             "\nMAIN MENU",
@@ -215,11 +218,21 @@ def build_system_prompt(config: dict) -> str:
         ]
         for i, item in enumerate(menu_items, 1):
             menu_lines.append(f"{i}. {item.get('label', '')}")
-            for j, sub in enumerate(item.get("subItems") or [], 1):
-                menu_lines.append(f"   {i}.{j}. {sub}")
+            for j, sub in enumerate(item.get("subItems") or [], 0):
+                sub_letter = _sub_labels[j] if j < len(_sub_labels) else str(j + 1)
+                if isinstance(sub, str):
+                    sub_label = sub
+                    subsubs: list = []
+                else:
+                    sub_label = sub.get("label", "")
+                    subsubs = sub.get("subItems") or []
+                menu_lines.append(f"   {sub_letter}. {sub_label}")
+                for ss in subsubs:
+                    menu_lines.append(f"      - {ss}")
         menu_lines.append(
             "You must present this menu — and only this menu — whenever options need to be shown. "
-            "Never invent or suggest items not listed above."
+            "Never invent or suggest items not listed above.\n"
+            "Never skip levels. Always wait for the customer to choose before going deeper."
         )
         parts.append("\n".join(menu_lines))
 
