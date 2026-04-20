@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse, Response
 
 import agent
 import database
+import email_service
 import memory
 import transcribe as transcribe_mod
 import whatsapp
@@ -483,6 +484,60 @@ async def process_audio_message(customer_phone: str, media_id: str, mime_type: s
             exc,
             exc_info=True,
         )
+
+
+# ---------------------------------------------------------------------------
+# Internal: booking confirmation email (called by the Node.js dashboard)
+# ---------------------------------------------------------------------------
+
+
+@app.post("/internal/booking-confirmed")
+async def booking_confirmed(request: Request):
+    """
+    Called by the Node.js server after a meeting slot is confirmed.
+    Sends a booking confirmation email to the customer.
+
+    Protected by x-webhook-secret header — same secret shared across services.
+
+    Expected body:
+      {
+        "to": "customer@example.com",
+        "customer_name": "Ahmed",
+        "meeting_time": "Mon 21 Apr 2026 at 10:00 AST",
+        "meeting_link": "https://wak.daily.co/abc123",
+        "agent_name": "WAK Solutions Team"   // optional
+      }
+    """
+    secret = request.headers.get("x-webhook-secret")
+    if secret != WEBHOOK_SECRET:
+        logger.warning("[WARN] [main] /internal/booking-confirmed rejected — invalid secret")
+        return JSONResponse(content={"error": "Forbidden"}, status_code=403)
+
+    body = await request.json()
+    to = (body.get("to") or "").strip()
+    customer_name = (body.get("customer_name") or "there").strip()
+    meeting_time = (body.get("meeting_time") or "").strip()
+    meeting_link = (body.get("meeting_link") or "").strip()
+    agent_name = (body.get("agent_name") or "WAK Solutions Team").strip()
+
+    if not to or not meeting_time or not meeting_link:
+        return JSONResponse(
+            content={"error": "Missing required fields: to, meeting_time, meeting_link"},
+            status_code=400,
+        )
+
+    html = email_service.build_booking_confirmation_html(
+        customer_name=customer_name,
+        meeting_time=meeting_time,
+        meeting_link=meeting_link,
+        agent_name=agent_name,
+    )
+    ok = email_service.send_email(
+        to=to,
+        subject="Your meeting with WAK Solutions is confirmed",
+        html_body=html,
+    )
+    return JSONResponse(content={"sent": ok}, status_code=200)
 
 
 # ---------------------------------------------------------------------------
