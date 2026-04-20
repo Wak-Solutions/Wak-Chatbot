@@ -487,6 +487,38 @@ async def process_audio_message(customer_phone: str, media_id: str, mime_type: s
 
 
 # ---------------------------------------------------------------------------
+# Generic send-email endpoint (called by the Node.js dashboard)
+# ---------------------------------------------------------------------------
+
+
+@app.post("/api/send-email")
+async def send_email_endpoint(request: Request):
+    """
+    Send an email via Gmail SMTP.
+
+    No authentication required — this service is internal and not exposed
+    publicly (Railway private networking or same-origin calls only).
+
+    Expected body: { "to": str, "subject": str, "body": str }
+    """
+    body = await request.json()
+    to = (body.get("to") or "").strip()
+    subject = (body.get("subject") or "").strip()
+    html_body = (body.get("body") or "").strip()
+
+    print(f"[SEND-EMAIL] endpoint hit — to={to}, subject={subject}", flush=True)
+
+    if not to or not subject or not html_body:
+        return JSONResponse(
+            content={"error": "Missing required fields: to, subject, body"},
+            status_code=400,
+        )
+
+    ok = email_service.send_email(to=to, subject=subject, html_body=html_body)
+    return JSONResponse(content={"sent": ok}, status_code=200)
+
+
+# ---------------------------------------------------------------------------
 # Internal: booking confirmation email (called by the Node.js dashboard)
 # ---------------------------------------------------------------------------
 
