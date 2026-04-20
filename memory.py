@@ -3,6 +3,7 @@ memory.py — conversation history load and save.
 """
 
 import logging
+import uuid
 
 import database
 from config import MEMORY_WINDOW
@@ -104,12 +105,27 @@ async def save_message(
 
     try:
         async with database.pool.acquire() as conn:
+            # Resolve conversation_id: reuse if within 24 hours, else start a new session
+            row = await conn.fetchrow(
+                """
+                SELECT conversation_id FROM messages
+                WHERE customer_phone = $1 AND company_id = $2
+                  AND conversation_id IS NOT NULL
+                  AND created_at > NOW() - INTERVAL '24 hours'
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                customer_phone,
+                company_id,
+            )
+            conversation_id = str(row["conversation_id"]) if row else str(uuid.uuid4())
+
             await conn.execute(
                 """
                 INSERT INTO messages
                   (customer_phone, direction, sender, message_text,
-                   media_type, media_url, transcription, company_id, created_at)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+                   media_type, media_url, transcription, company_id, created_at,
+                   conversation_id)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), $9::uuid)
                 """,
                 customer_phone,
                 direction,
@@ -119,6 +135,7 @@ async def save_message(
                 media_url,
                 transcription,
                 company_id,
+                conversation_id,
             )
         logger.info(
             "[INFO] [memory] Message saved — phone: %s, direction: %s, sender: %s, media_type: %s",
