@@ -50,7 +50,7 @@ def send_email(to: str, subject: str, html_body: str) -> bool:
     msg.attach(MIMEText(html_body, "html", "utf-8"))
 
     try:
-        with smtplib.SMTP(_SMTP_HOST, _SMTP_PORT, timeout=10) as smtp:
+        with smtplib.SMTP(_SMTP_HOST, _SMTP_PORT, timeout=30) as smtp:
             smtp.ehlo()
             smtp.starttls()
             smtp.ehlo()
