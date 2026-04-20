@@ -508,13 +508,16 @@ async def booking_confirmed(request: Request):
         "agent_name": "WAK Solutions Team"   // optional
       }
     """
+    print("[BOOKING-CONFIRMED] endpoint hit", flush=True)
     secret = request.headers.get("x-webhook-secret")
     if secret != WEBHOOK_SECRET:
         logger.warning("[WARN] [main] /internal/booking-confirmed rejected — invalid secret")
+        print("[BOOKING-CONFIRMED] rejected — invalid secret", flush=True)
         return JSONResponse(content={"error": "Forbidden"}, status_code=403)
 
     body = await request.json()
     to = (body.get("to") or "").strip()
+    print(f"[BOOKING-CONFIRMED] payload received — to={to}", flush=True)
     customer_name = (body.get("customer_name") or "there").strip()
     meeting_time = (body.get("meeting_time") or "").strip()
     meeting_link = (body.get("meeting_link") or "").strip()

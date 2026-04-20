@@ -32,10 +32,14 @@ def send_email(to: str, subject: str, html_body: str) -> bool:
     gmail_address = os.environ.get("GMAIL_ADDRESS", "").strip()
     app_password = os.environ.get("GMAIL_APP_PASSWORD", "").strip()
 
+    print(f"Gmail config: GMAIL_ADDRESS set={bool(gmail_address)}, GMAIL_APP_PASSWORD set={bool(app_password)}", flush=True)
+    print(f"EMAIL ATTEMPT: to={to}", flush=True)
+
     if not gmail_address or not app_password:
         logger.warning(
             "[WARN] [email_service] GMAIL_ADDRESS or GMAIL_APP_PASSWORD not set — email not sent"
         )
+        print("EMAIL ERROR: missing Gmail credentials", flush=True)
         return False
 
     msg = MIMEMultipart("alternative")
@@ -53,19 +57,23 @@ def send_email(to: str, subject: str, html_body: str) -> bool:
             smtp.login(gmail_address, app_password)
             smtp.sendmail(gmail_address, to, msg.as_string())
         logger.info("[INFO] [email_service] Email sent — to: %s, subject: %s", to, subject)
+        print(f"EMAIL SUCCESS: to={to}", flush=True)
         return True
-    except smtplib.SMTPAuthenticationError:
+    except smtplib.SMTPAuthenticationError as exc:
         logger.error(
             "[ERROR] [email_service] SMTP authentication failed — check GMAIL_APP_PASSWORD"
         )
+        print(f"EMAIL ERROR: SMTPAuthenticationError — {exc}", flush=True)
         return False
-    except smtplib.SMTPRecipientsRefused:
+    except smtplib.SMTPRecipientsRefused as exc:
         logger.error(
             "[ERROR] [email_service] Recipient refused — to: %s", to
         )
+        print(f"EMAIL ERROR: SMTPRecipientsRefused — to={to}, error={exc}", flush=True)
         return False
     except Exception as exc:
         logger.error("[ERROR] [email_service] Failed to send email — to: %s, error: %s", to, exc)
+        print(f"EMAIL ERROR: {type(exc).__name__} — {exc}", flush=True)
         return False
 
 
