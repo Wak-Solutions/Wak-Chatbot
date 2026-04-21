@@ -77,6 +77,34 @@ async def load_history(customer_phone: str, company_id: int = 1) -> list[dict]:
         raise
 
 
+async def get_conversation_id(customer_phone: str, company_id: int) -> str | None:
+    """
+    Return the active conversation_id for this customer within the last 24 hours,
+    or None if no session exists yet.
+    """
+    try:
+        async with database.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT conversation_id FROM messages
+                WHERE customer_phone = $1 AND company_id = $2
+                  AND conversation_id IS NOT NULL
+                  AND created_at > NOW() - INTERVAL '24 hours'
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                customer_phone,
+                company_id,
+            )
+        return str(row["conversation_id"]) if row else None
+    except Exception as exc:
+        logger.error(
+            "[ERROR] [memory] get_conversation_id failed — phone: %s, error: %s",
+            _mask_phone(customer_phone),
+            exc,
+        )
+        return None
+
+
 async def save_message(
     customer_phone: str,
     direction: str,

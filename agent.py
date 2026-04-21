@@ -19,6 +19,7 @@ import openai
 
 import database
 import memory
+import menu as menu_nav
 from config import DASHBOARD_URL, OPENAI_API_KEY, OPENAI_MODEL, WEBHOOK_SECRET
 from intent import ai_scheduling_manually, wants_escalation, wants_meeting
 from notifications import mask_phone, notify_dashboard
@@ -156,6 +157,38 @@ async def get_reply(
         company_id=company_id,
     )
 
+    # ── Step 2a: Deterministic menu navigation ────────────────────────────────
+    # Get the active conversation_id (None for brand-new customers).
+    _conv_id = await memory.get_conversation_id(customer_phone, company_id)
+
+    # Check if the customer is navigating the menu tree.
+    _menu_reply, _leaf_selection = await menu_nav.handle(
+        customer_phone, company_id, new_message, _conv_id or ""
+    )
+
+    if _menu_reply is not None:
+        # Mid-tree: send the next level's numbered options directly — no LLM needed.
+        if _save_inbound:
+            await memory.save_message(
+                customer_phone=customer_phone,
+                direction="inbound",
+                message_text=new_message,
+                company_id=company_id,
+            )
+        await memory.save_message(
+            customer_phone=customer_phone,
+            direction="outbound",
+            message_text=_menu_reply,
+            company_id=company_id,
+        )
+        logger.info(
+            "[INFO] [agent] Menu level sent — phone: %s",
+            mask_phone(customer_phone),
+        )
+        return _menu_reply, None
+    # _leaf_selection is a breadcrumb string when a leaf was reached; the LLM
+    # will handle the response with that context injected below.
+
     # ── Step 3: Human-agent request check ────────────────────────────────────
     if wants_escalation(new_message, history):
         logger.info(
@@ -200,6 +233,19 @@ async def get_reply(
     # ── Step 5: Build message list ────────────────────────────────────────────
     system_content = await get_system_prompt(company_id)
 
+    # Append a menu-navigation override so OpenAI only ever shows the top-level
+    # items — sub-levels are handled deterministically by menu_nav.handle().
+    _top_menu = await menu_nav.format_top_level(company_id)
+    if _top_menu:
+        system_content += (
+            "\n\nMENU NAVIGATION RULE (overrides the MAIN MENU section above):\n"
+            "When presenting the service menu, display ONLY the top-level options "
+            "listed below — NEVER show sub-items. The customer selects by number and "
+            "the sub-options are delivered automatically.\n"
+            + _top_menu
+            + "\nWait for the customer to reply with a number before going deeper."
+        )
+
     # Inject a real booking URL into the system prompt so OpenAI never
     # invents a fake one. If no pending token exists, instruct OpenAI to
     # output a known placeholder that we catch and replace below.
@@ -222,10 +268,19 @@ async def get_reply(
             "Do NOT invent a URL."
         )
 
+    # When the customer just reached a leaf node in the menu tree, replace the
+    # bare number they sent with a meaningful description so OpenAI can respond
+    # correctly without seeing the full navigation history.
+    _effective_message = (
+        f"I'd like to enquire about: {_leaf_selection}"
+        if _leaf_selection
+        else new_message
+    )
+
     messages = (
         [{"role": "system", "content": system_content}]
         + history
-        + [{"role": "user", "content": new_message}]
+        + [{"role": "user", "content": _effective_message}]
     )
 
     # ── Step 6: First OpenAI call ─────────────────────────────────────────────
@@ -357,5 +412,12 @@ async def get_reply(
         message_text=final_reply,
         company_id=company_id,
     )
+
+    # ── Step 10: (Re)initialise menu navigation for the next message ──────────
+    # After every LLM reply, reset menu state to top level so the customer can
+    # always navigate by number on their next message.
+    _post_conv_id = await memory.get_conversation_id(customer_phone, company_id)
+    if _post_conv_id:
+        await menu_nav.start(customer_phone, company_id, _post_conv_id)
 
     return final_reply, None
