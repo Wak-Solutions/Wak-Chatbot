@@ -28,10 +28,10 @@ async def notify_dashboard(
     company_id: int = 1,
 ) -> None:
     """
-    Notify the dashboard of a new message or escalation.
+    Notify the dashboard of a new message or human-agent request.
     Fires and forgets — never blocks or crashes the main flow.
 
-    event: "message" or "escalation"
+    event: "message" | "human_requested"
     """
     try:
         if event == "message":
@@ -41,11 +41,10 @@ async def notify_dashboard(
                 "message_text": message_text,
                 "company_id": company_id,
             }
-        elif event == "escalation":
-            url = f"{DASHBOARD_URL}/api/escalate"
+        elif event == "human_requested":
+            url = f"{DASHBOARD_URL}/api/human-requested"
             payload = {
                 "customer_phone": customer_phone,
-                "escalation_reason": escalation_reason,
                 "company_id": company_id,
             }
         else:

@@ -156,17 +156,16 @@ async def get_reply(
         company_id=company_id,
     )
 
-    # ── Step 3: Escalation check ──────────────────────────────────────────────
+    # ── Step 3: Human-agent request check ────────────────────────────────────
     if wants_escalation(new_message, history):
         logger.info(
-            "[INFO] [agent] Escalation intent detected — phone: %s",
+            "[INFO] [agent] Human agent requested — phone: %s",
             mask_phone(customer_phone),
         )
         await notify_dashboard(
-            event="escalation",
+            event="human_requested",
             customer_phone=customer_phone,
             message_text=new_message,
-            escalation_reason=new_message,
             company_id=company_id,
         )
 
