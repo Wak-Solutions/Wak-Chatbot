@@ -42,6 +42,7 @@ async def create_pool() -> None:
             ssl="require",
             min_size=2,
             max_size=10,
+            statement_cache_size=0,
         )
         logger.info("[INFO] [database] Connection pool created — min: 2, max: 10")
     except Exception as exc:
