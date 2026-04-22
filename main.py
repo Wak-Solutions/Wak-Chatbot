@@ -15,7 +15,7 @@ import email_service
 import memory
 import transcribe as transcribe_mod
 import whatsapp
-from config import VERIFY_TOKEN, WEBHOOK_SECRET, WHATSAPP_APP_SECRET
+from config import VERIFY_TOKEN, WEBHOOK_SECRET
 from notifications import mask_phone
 
 # ---------------------------------------------------------------------------
@@ -159,9 +159,12 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks):
     Resolves company_id from the WhatsApp phone_number_id in the webhook metadata.
     Falls back to company_id=1 if the phone number is not yet registered.
     """
-    # ── Signature verification ────────────────────────────────────────
-    # Must read raw bytes BEFORE calling request.json() — parsing first
-    # consumes the body and makes the signature check impossible.
+    # ── Signature verification (per-company) ──────────────────────────
+    # We must read the raw bytes BEFORE calling request.json(). To pick the
+    # right App Secret we do a pre-parse of the body to extract the
+    # phone_number_id — this pre-parse is UNTRUSTED and only used to look
+    # up which company's secret we should verify against. The actual
+    # signature check happens below with that secret.
     raw_body = await request.body()
 
     signature_header = request.headers.get("X-Hub-Signature-256", "")
@@ -169,18 +172,44 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks):
         logger.warning("[WARN] [main] Webhook POST rejected — missing X-Hub-Signature-256 header")
         return JSONResponse(content={"error": "Forbidden"}, status_code=403)
 
+    try:
+        _prelim = json.loads(raw_body)
+        _entry = _prelim.get("entry", [])
+        _changes = _entry[0].get("changes", []) if _entry else []
+        _value = _changes[0].get("value", {}) if _changes else {}
+        _pnid = _value.get("metadata", {}).get("phone_number_id", "")
+    except Exception:
+        logger.warning("[WARN] [main] Webhook POST rejected — malformed JSON body")
+        return JSONResponse(content={"error": "Forbidden"}, status_code=403)
+
+    if not _pnid:
+        logger.info("[INFO] [main] Webhook with no phone_number_id — likely a status update, accepting")
+        # No routing possible and no content to process; return 200 so Meta stops retrying.
+        return JSONResponse(content={"status": "ok"}, status_code=200)
+
+    app_secret = await database.get_app_secret_by_phone_number_id(_pnid)
+    if not app_secret:
+        logger.warning(
+            "[WARN] [main] Webhook POST rejected — no app_secret registered for phone_number_id=%s",
+            _pnid,
+        )
+        return JSONResponse(content={"error": "Forbidden"}, status_code=403)
+
     expected_sig = "sha256=" + hmac.new(
-        WHATSAPP_APP_SECRET.encode(),
+        app_secret.encode(),
         raw_body,
         hashlib.sha256,
     ).hexdigest()
 
     if not hmac.compare_digest(expected_sig, signature_header):
-        logger.warning("[WARN] [main] Webhook POST rejected — signature mismatch")
+        logger.warning(
+            "[WARN] [main] Webhook POST rejected — signature mismatch for phone_number_id=%s",
+            _pnid,
+        )
         return JSONResponse(content={"error": "Forbidden"}, status_code=403)
     # ── End signature verification ────────────────────────────────────
 
-    body = json.loads(raw_body)
+    body = _prelim
 
     try:
         entry = body.get("entry", [])

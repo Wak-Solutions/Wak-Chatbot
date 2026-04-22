@@ -124,8 +124,8 @@ _creds_cache: dict[int, dict] = {}
 
 async def get_company_whatsapp_creds(company_id: int) -> dict | None:
     """
-    Returns {'token': str, 'phone_id': str} for the given company, or None
-    if the company has no WhatsApp credentials configured.
+    Returns {'token': str, 'phone_id': str, 'app_secret': str | None} for the
+    given company, or None if the company has no WhatsApp credentials configured.
     Cached in-process after the first lookup.
     """
     if company_id in _creds_cache:
@@ -134,7 +134,7 @@ async def get_company_whatsapp_creds(company_id: int) -> dict | None:
     try:
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
-                "SELECT whatsapp_token, whatsapp_phone_number_id FROM companies WHERE id = $1",
+                "SELECT whatsapp_token, whatsapp_phone_number_id, whatsapp_app_secret FROM companies WHERE id = $1",
                 company_id,
             )
         if not row or not row["whatsapp_token"] or not row["whatsapp_phone_number_id"]:
@@ -142,13 +142,36 @@ async def get_company_whatsapp_creds(company_id: int) -> dict | None:
                 "[ERROR] [database] Company %d has no WhatsApp credentials configured", company_id
             )
             return None
-        creds = {"token": row["whatsapp_token"], "phone_id": row["whatsapp_phone_number_id"]}
+        creds = {
+            "token": row["whatsapp_token"],
+            "phone_id": row["whatsapp_phone_number_id"],
+            "app_secret": row["whatsapp_app_secret"],
+        }
         _creds_cache[company_id] = creds
         return creds
     except Exception as exc:
         logger.error(
             "[ERROR] [database] get_company_whatsapp_creds failed — company_id: %d, error: %s",
             company_id, exc, exc_info=True,
+        )
+        return None
+
+
+async def get_app_secret_by_phone_number_id(phone_number_id: str) -> str | None:
+    """
+    Returns the Meta App Secret for the company that owns this phone_number_id.
+    Used to verify inbound webhook signatures per-company.
+    """
+    try:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT whatsapp_app_secret FROM companies WHERE whatsapp_phone_number_id = $1 LIMIT 1",
+                phone_number_id,
+            )
+        return row["whatsapp_app_secret"] if row else None
+    except Exception as exc:
+        logger.error(
+            "[ERROR] [database] get_app_secret_by_phone_number_id failed: %s", exc, exc_info=True,
         )
         return None
 
