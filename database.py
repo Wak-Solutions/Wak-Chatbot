@@ -114,6 +114,45 @@ async def get_company_by_phone_number_id(phone_number_id: str) -> int | None:
 
 
 # ---------------------------------------------------------------------------
+# Company WhatsApp credentials
+# ---------------------------------------------------------------------------
+
+# In-process cache: company_id → {token, phone_id}
+_creds_cache: dict[int, dict] = {}
+
+
+async def get_company_whatsapp_creds(company_id: int) -> dict | None:
+    """
+    Returns {'token': str, 'phone_id': str} for the given company, or None
+    if the company has no WhatsApp credentials configured.
+    Cached in-process after the first lookup.
+    """
+    if company_id in _creds_cache:
+        return _creds_cache[company_id]
+
+    try:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT whatsapp_token, whatsapp_phone_number_id FROM companies WHERE id = $1",
+                company_id,
+            )
+        if not row or not row["whatsapp_token"] or not row["whatsapp_phone_number_id"]:
+            logger.error(
+                "[ERROR] [database] Company %d has no WhatsApp credentials configured", company_id
+            )
+            return None
+        creds = {"token": row["whatsapp_token"], "phone_id": row["whatsapp_phone_number_id"]}
+        _creds_cache[company_id] = creds
+        return creds
+    except Exception as exc:
+        logger.error(
+            "[ERROR] [database] get_company_whatsapp_creds failed — company_id: %d, error: %s",
+            company_id, exc, exc_info=True,
+        )
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Orders
 # ---------------------------------------------------------------------------
 
@@ -257,7 +296,7 @@ async def get_meetings_to_notify() -> list[dict]:
         async with pool.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT id, customer_phone, meeting_link, meeting_token
+                SELECT id, customer_phone, meeting_link, meeting_token, company_id
                 FROM meetings
                 WHERE status != 'completed'
                   AND link_sent = FALSE

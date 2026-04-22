@@ -51,7 +51,14 @@ async def _link_delivery_loop():
                     else m["meeting_link"]
                 )
                 msg = f"Your meeting is starting soon! Join here: {meeting_url}"
-                await whatsapp.send_message(to=m["customer_phone"], text=msg)
+                _creds = await database.get_company_whatsapp_creds(m["company_id"])
+                if _creds is None:
+                    logger.error(
+                        "[ERROR] [main] Link delivery — company %d has no WhatsApp creds, skipping",
+                        m["company_id"],
+                    )
+                    continue
+                await whatsapp.send_message(to=m["customer_phone"], text=msg, token=_creds["token"], phone_id=_creds["phone_id"])
                 await database.mark_link_sent(m["id"])
                 logger.info(
                     "[INFO] [main] Meeting link sent — phone: %s, meeting_id: %s",
@@ -193,6 +200,15 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks):
             # Return 200 so Meta does not retry — retrying won't fix an unregistered number.
             return JSONResponse(content={"status": "unroutable"}, status_code=200)
 
+        # Fetch this company's WhatsApp credentials — needed for all outbound sends.
+        creds = await database.get_company_whatsapp_creds(company_id)
+        if creds is None:
+            logger.error(
+                "[ERROR] [main] Company %d has no WhatsApp credentials — cannot send replies",
+                company_id,
+            )
+            return JSONResponse(content={"status": "no_creds"}, status_code=200)
+
         message = messages_list[0]
         msg_type = message.get("type")
         customer_phone = message.get("from")
@@ -214,7 +230,7 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks):
                 mask_phone(customer_phone),
                 company_id,
             )
-            background_tasks.add_task(process_message, customer_phone, message_text, company_id)
+            background_tasks.add_task(process_message, customer_phone, message_text, company_id, creds)
 
         elif msg_type == "audio":
             audio_data = message.get("audio", {})
@@ -233,7 +249,7 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks):
                 company_id,
             )
             background_tasks.add_task(
-                process_audio_message, customer_phone, media_id, mime_type, company_id
+                process_audio_message, customer_phone, media_id, mime_type, company_id, creds
             )
 
         else:
@@ -273,8 +289,13 @@ async def send_agent_message(request: Request):
     if not customer_phone or not message_text:
         return JSONResponse(content={"error": "Missing fields"}, status_code=400)
 
+    creds = await database.get_company_whatsapp_creds(company_id)
+    if creds is None:
+        logger.error("[ERROR] [main] /send — company %d has no WhatsApp credentials", company_id)
+        return JSONResponse(content={"error": "WhatsApp credentials not configured"}, status_code=503)
+
     try:
-        await whatsapp.send_message(to=customer_phone, text=message_text)
+        await whatsapp.send_message(to=customer_phone, text=message_text, token=creds["token"], phone_id=creds["phone_id"])
         await memory.save_message(
             customer_phone=customer_phone,
             direction="outbound",
@@ -302,7 +323,7 @@ async def send_agent_message(request: Request):
 # ---------------------------------------------------------------------------
 
 
-async def process_message(customer_phone: str, message_text: str, company_id: int = 1):
+async def process_message(customer_phone: str, message_text: str, company_id: int, creds: dict):
     """Generate and send a bot reply for an inbound text message."""
     try:
         logger.info(
@@ -316,14 +337,14 @@ async def process_message(customer_phone: str, message_text: str, company_id: in
             company_id=company_id,
         )
 
-        await whatsapp.send_message(to=customer_phone, text=reply)
+        await whatsapp.send_message(to=customer_phone, text=reply, token=creds["token"], phone_id=creds["phone_id"])
         logger.info(
             "[INFO] [main] Reply sent — phone: %s, type: text",
             mask_phone(customer_phone),
         )
 
         if meeting_message:
-            await whatsapp.send_message(to=customer_phone, text=meeting_message)
+            await whatsapp.send_message(to=customer_phone, text=meeting_message, token=creds["token"], phone_id=creds["phone_id"])
             await memory.save_message(
                 customer_phone=customer_phone,
                 direction="outbound",
@@ -345,7 +366,7 @@ async def process_message(customer_phone: str, message_text: str, company_id: in
         )
 
 
-async def process_audio_message(customer_phone: str, media_id: str, mime_type: str, company_id: int = 1):
+async def process_audio_message(customer_phone: str, media_id: str, mime_type: str, company_id: int, creds: dict):
     """
     Handle an incoming WhatsApp voice note end-to-end:
     1. Download audio from Meta's CDN.
@@ -377,6 +398,8 @@ async def process_audio_message(customer_phone: str, media_id: str, mime_type: s
                         "Could you send a shorter message (under 3 minutes) "
                         "or type your question instead?"
                     ),
+                    token=creds["token"],
+                    phone_id=creds["phone_id"],
                 )
             else:
                 raise
@@ -414,6 +437,8 @@ async def process_audio_message(customer_phone: str, media_id: str, mime_type: s
                     "Sorry, I couldn't process your voice message. "
                     "Could you type your question instead?"
                 ),
+                token=creds["token"],
+                phone_id=creds["phone_id"],
             )
             return
 
@@ -438,6 +463,8 @@ async def process_audio_message(customer_phone: str, media_id: str, mime_type: s
                     "I received your voice message but couldn't make out any words. "
                     "Could you type your question instead?"
                 ),
+                token=creds["token"],
+                phone_id=creds["phone_id"],
             )
             return
 
@@ -461,14 +488,14 @@ async def process_audio_message(customer_phone: str, media_id: str, mime_type: s
             company_id=company_id,
         )
 
-        await whatsapp.send_message(to=customer_phone, text=reply)
+        await whatsapp.send_message(to=customer_phone, text=reply, token=creds["token"], phone_id=creds["phone_id"])
         logger.info(
             "[INFO] [main] Reply sent after voice note — phone: %s, type: text",
             mask_phone(customer_phone),
         )
 
         if meeting_message:
-            await whatsapp.send_message(to=customer_phone, text=meeting_message)
+            await whatsapp.send_message(to=customer_phone, text=meeting_message, token=creds["token"], phone_id=creds["phone_id"])
             await memory.save_message(
                 customer_phone=customer_phone,
                 direction="outbound",

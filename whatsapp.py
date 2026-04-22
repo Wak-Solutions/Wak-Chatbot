@@ -6,18 +6,7 @@ import logging
 
 import httpx
 
-from config import WHATSAPP_PHONE_ID, WHATSAPP_TOKEN
-
 logger = logging.getLogger(__name__)
-
-WHATSAPP_API_URL = (
-    f"https://graph.facebook.com/v19.0/{WHATSAPP_PHONE_ID}/messages"
-)
-
-HEADERS = {
-    "Authorization": f"Bearer {WHATSAPP_TOKEN}",
-    "Content-Type": "application/json",
-}
 
 
 def _mask_phone(phone: str) -> str:
@@ -26,17 +15,24 @@ def _mask_phone(phone: str) -> str:
     return f"****{phone[-4:]}"
 
 
-async def send_message(to: str, text: str) -> None:
+async def send_message(to: str, text: str, *, token: str, phone_id: str) -> None:
     """
     Send a text message via the Meta WhatsApp Cloud API.
 
     Args:
-        to:   Recipient phone in international format without +, e.g. "971501234567".
-        text: Message body. Can include newlines and emoji.
+        to:       Recipient phone in international format without +, e.g. "971501234567".
+        text:     Message body. Can include newlines and emoji.
+        token:    The company's WhatsApp access token.
+        phone_id: The company's WhatsApp phone number ID.
 
     Raises:
         httpx.HTTPStatusError: If Meta returns a 4xx/5xx response.
     """
+    url = f"https://graph.facebook.com/v19.0/{phone_id}/messages"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
     payload = {
         "messaging_product": "whatsapp",
         "to": to,
@@ -45,17 +41,13 @@ async def send_message(to: str, text: str) -> None:
     }
 
     logger.info(
-        "[INFO] [whatsapp] Sending message — phone: %s, type: text",
+        "[INFO] [whatsapp] Sending message — phone: %s, phone_id: %s",
         _mask_phone(to),
+        phone_id,
     )
 
     async with httpx.AsyncClient() as client:
-        response = await client.post(
-            url=WHATSAPP_API_URL,
-            headers=HEADERS,
-            json=payload,
-            timeout=10.0,
-        )
+        response = await client.post(url=url, headers=headers, json=payload, timeout=10.0)
 
     if response.is_success:
         logger.info(
