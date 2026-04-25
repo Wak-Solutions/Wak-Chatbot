@@ -175,12 +175,8 @@ async def get_reply(
                 message_text=new_message,
                 company_id=company_id,
             )
-        await memory.save_message(
-            customer_phone=customer_phone,
-            direction="outbound",
-            message_text=_menu_reply,
-            company_id=company_id,
-        )
+        # Outbound is persisted by main.py AFTER whatsapp.send_message succeeds,
+        # so a failed Meta send does not leave a ghost message in the dashboard.
         logger.info(
             "[INFO] [agent] Menu level sent — phone: %s",
             mask_phone(customer_phone),
@@ -218,12 +214,7 @@ async def get_reply(
                     message_text=new_message,
                     company_id=company_id,
                 )
-            await memory.save_message(
-                customer_phone=customer_phone,
-                direction="outbound",
-                message_text=booking_reply,
-                company_id=company_id,
-            )
+            # Outbound persisted by main.py after successful send.
             logger.info(
                 "[INFO] [agent] Booking link sent — phone: %s",
                 mask_phone(customer_phone),
@@ -398,7 +389,9 @@ async def get_reply(
                 f"Here's your personal booking link — valid for 24 hours: {override_url}"
             )
 
-    # ── Step 9: Save exchange ─────────────────────────────────────────────────
+    # ── Step 9: Save inbound only ─────────────────────────────────────────────
+    # Outbound is persisted by main.py after whatsapp.send_message succeeds,
+    # so a Meta send failure doesn't leave a ghost reply in the dashboard.
     if _save_inbound:
         await memory.save_message(
             customer_phone=customer_phone,
@@ -406,12 +399,6 @@ async def get_reply(
             message_text=new_message,
             company_id=company_id,
         )
-    await memory.save_message(
-        customer_phone=customer_phone,
-        direction="outbound",
-        message_text=final_reply,
-        company_id=company_id,
-    )
 
     # ── Step 10: (Re)initialise menu navigation for the next message ──────────
     # After every LLM reply, reset menu state to top level so the customer can

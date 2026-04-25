@@ -367,6 +367,13 @@ async def process_message(customer_phone: str, message_text: str, company_id: in
         )
 
         await whatsapp.send_message(to=customer_phone, text=reply, token=creds["token"], phone_id=creds["phone_id"])
+        await memory.save_message(
+            customer_phone=customer_phone,
+            direction="outbound",
+            message_text=reply,
+            sender="ai",
+            company_id=company_id,
+        )
         logger.info(
             "[INFO] [main] Reply sent — phone: %s, type: text",
             mask_phone(customer_phone),
@@ -518,6 +525,13 @@ async def process_audio_message(customer_phone: str, media_id: str, mime_type: s
         )
 
         await whatsapp.send_message(to=customer_phone, text=reply, token=creds["token"], phone_id=creds["phone_id"])
+        await memory.save_message(
+            customer_phone=customer_phone,
+            direction="outbound",
+            message_text=reply,
+            sender="ai",
+            company_id=company_id,
+        )
         logger.info(
             "[INFO] [main] Reply sent after voice note — phone: %s, type: text",
             mask_phone(customer_phone),

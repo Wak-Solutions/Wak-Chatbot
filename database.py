@@ -118,19 +118,13 @@ async def get_company_by_phone_number_id(phone_number_id: str) -> int | None:
 # Company WhatsApp credentials
 # ---------------------------------------------------------------------------
 
-# In-process cache: company_id → {token, phone_id}
-_creds_cache: dict[int, dict] = {}
-
-
 async def get_company_whatsapp_creds(company_id: int) -> dict | None:
     """
     Returns {'token': str, 'phone_id': str, 'app_secret': str | None} for the
     given company, or None if the company has no WhatsApp credentials configured.
-    Cached in-process after the first lookup.
+    Always reads from the DB — a stale in-process cache caused 190 errors after
+    admins rotated their Meta access token.
     """
-    if company_id in _creds_cache:
-        return _creds_cache[company_id]
-
     try:
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
@@ -142,13 +136,11 @@ async def get_company_whatsapp_creds(company_id: int) -> dict | None:
                 "[ERROR] [database] Company %d has no WhatsApp credentials configured", company_id
             )
             return None
-        creds = {
+        return {
             "token": row["whatsapp_token"],
             "phone_id": row["whatsapp_phone_number_id"],
             "app_secret": row["whatsapp_app_secret"],
         }
-        _creds_cache[company_id] = creds
-        return creds
     except Exception as exc:
         logger.error(
             "[ERROR] [database] get_company_whatsapp_creds failed — company_id: %d, error: %s",
