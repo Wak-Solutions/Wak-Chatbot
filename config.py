@@ -28,10 +28,6 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 
 # ── Meta WhatsApp Cloud API ───────────────────────────────────────────
 
-# Permanent access token from your Meta developer dashboard.
-# This authorises your server to send WhatsApp messages.
-WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
-
 # The phone number ID — not the phone number itself.
 # Meta uses this to identify which WhatsApp number is sending the message.
 WHATSAPP_PHONE_ID = os.getenv("WHATSAPP_PHONE_ID")

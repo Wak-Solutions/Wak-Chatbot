@@ -8,7 +8,7 @@ from io import BytesIO
 import httpx
 from openai import AsyncOpenAI
 
-from config import OPENAI_API_KEY, WHATSAPP_TOKEN
+from config import OPENAI_API_KEY
 
 logger = logging.getLogger(__name__)
 
@@ -38,12 +38,16 @@ def _ext(mime_type: str) -> str:
     return _MIME_TO_EXT.get(base, "ogg")
 
 
-async def download_media(media_id: str) -> tuple[bytes, str]:
+async def download_media(media_id: str, *, token: str) -> tuple[bytes, str]:
     """
     Download a WhatsApp voice note from Meta's CDN.
 
     Step 1: GET /v21.0/{media_id} → resolve CDN URL and MIME type.
     Step 2: GET {cdn_url}         → download raw audio bytes.
+
+    Args:
+        media_id: The Meta media ID returned in the inbound webhook.
+        token:    The owning company's WhatsApp access token.
 
     Returns:
         (audio_bytes, mime_type)
@@ -52,7 +56,7 @@ async def download_media(media_id: str) -> tuple[bytes, str]:
         ValueError: If the file is too large for Whisper.
         httpx.*:    If Meta's API returns an error.
     """
-    auth_headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}"}
+    auth_headers = {"Authorization": f"Bearer {token}"}
 
     async with httpx.AsyncClient() as client:
         # Step 1 — resolve the media ID to a CDN URL

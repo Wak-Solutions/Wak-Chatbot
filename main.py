@@ -420,7 +420,7 @@ async def process_audio_message(customer_phone: str, media_id: str, mime_type: s
 
         # Step 1: Download
         try:
-            audio_bytes, actual_mime = await transcribe_mod.download_media(media_id)
+            audio_bytes, actual_mime = await transcribe_mod.download_media(media_id, token=creds["token"])
         except ValueError as exc:
             if "too large" in str(exc).lower():
                 logger.warning(
