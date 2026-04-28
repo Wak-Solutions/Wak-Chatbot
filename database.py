@@ -185,6 +185,28 @@ async def get_company_by_webhook_secret(secret: str) -> dict | None:
         return None
 
 
+async def get_webhook_secret_by_company_id(company_id: int) -> str | None:
+    """
+    Return the per-tenant webhook secret for a given company.
+    Used by the Python bot when calling internal Agents API endpoints so it
+    can send the correct x-webhook-secret header instead of a shared secret.
+    Returns None if the company has no secret or is inactive.
+    """
+    try:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT webhook_secret FROM companies WHERE id = $1 AND is_active = true LIMIT 1",
+                company_id,
+            )
+        return row["webhook_secret"] if row else None
+    except Exception as exc:
+        logger.warning(
+            "[WARN] [database] get_webhook_secret_by_company_id failed — company_id: %d, error: %s",
+            company_id, exc, exc_info=True,
+        )
+        return None
+
+
 async def get_app_secret_by_phone_number_id(phone_number_id: str) -> str | None:
     """
     Returns the Meta App Secret for the company that owns this phone_number_id.

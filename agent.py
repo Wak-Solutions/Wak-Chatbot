@@ -20,7 +20,7 @@ import openai
 import database
 import memory
 import menu as menu_nav
-from config import DASHBOARD_URL, OPENAI_API_KEY, OPENAI_MODEL, WEBHOOK_SECRET
+from config import DASHBOARD_URL, OPENAI_API_KEY, OPENAI_MODEL
 from intent import ai_scheduling_manually, wants_escalation, wants_meeting
 from notifications import mask_phone, notify_dashboard
 from prompt import get_system_prompt
@@ -81,11 +81,18 @@ async def _resolve_booking_url(
 
             # No existing token — create one now.
             try:
+                secret = await database.get_webhook_secret_by_company_id(company_id)
+                if not secret:
+                    logger.error(
+                        "[ERROR] [agent] create-token — no webhook secret for company_id=%d",
+                        company_id,
+                    )
+                    return None
                 async with httpx.AsyncClient() as http:
                     resp = await http.post(
                         f"{DASHBOARD_URL}/api/meetings/create-token",
-                        json={"customer_phone": customer_phone, "company_id": company_id},
-                        headers={"x-webhook-secret": WEBHOOK_SECRET},
+                        json={"customer_phone": customer_phone},
+                        headers={"x-webhook-secret": secret},
                         timeout=10.0,
                     )
                     resp.raise_for_status()

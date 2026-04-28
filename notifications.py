@@ -8,7 +8,8 @@ import logging
 
 import httpx
 
-from config import DASHBOARD_URL, WEBHOOK_SECRET
+import database
+from config import DASHBOARD_URL
 
 logger = logging.getLogger(__name__)
 
@@ -34,18 +35,24 @@ async def notify_dashboard(
     event: "message" | "human_requested"
     """
     try:
+        secret = await database.get_webhook_secret_by_company_id(company_id)
+        if not secret:
+            logger.warning(
+                "[WARN] [notifications] No webhook secret for company_id=%d — notification skipped",
+                company_id,
+            )
+            return
+
         if event == "message":
             url = f"{DASHBOARD_URL}/api/incoming"
             payload = {
                 "customer_phone": customer_phone,
                 "message_text": message_text,
-                "company_id": company_id,
             }
         elif event == "human_requested":
             url = f"{DASHBOARD_URL}/api/human-requested"
             payload = {
                 "customer_phone": customer_phone,
-                "company_id": company_id,
             }
         else:
             logger.warning(
@@ -57,7 +64,7 @@ async def notify_dashboard(
             await client.post(
                 url=url,
                 json=payload,
-                headers={"x-webhook-secret": WEBHOOK_SECRET},
+                headers={"x-webhook-secret": secret},
                 timeout=5.0,
             )
 
