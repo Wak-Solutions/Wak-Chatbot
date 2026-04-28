@@ -358,7 +358,7 @@ async def mark_link_sent(meeting_id: int) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def store_voice_note(audio_bytes: bytes, mime_type: str) -> str:
+async def store_voice_note(audio_bytes: bytes, mime_type: str, company_id: int) -> str:
     """
     Persist voice note audio in the voice_notes table.
     Returns the UUID string that identifies this recording.
@@ -367,12 +367,13 @@ async def store_voice_note(audio_bytes: bytes, mime_type: str) -> str:
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                INSERT INTO voice_notes (audio_data, mime_type)
-                VALUES ($1, $2)
+                INSERT INTO voice_notes (audio_data, mime_type, company_id)
+                VALUES ($1, $2, $3)
                 RETURNING id::text
                 """,
                 audio_bytes,
                 mime_type,
+                company_id,
             )
         audio_id = row["id"]
         logger.info(
