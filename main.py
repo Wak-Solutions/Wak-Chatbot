@@ -4,9 +4,11 @@ import hmac
 import json
 import logging
 import os
+import secrets
+import uuid
 from contextlib import asynccontextmanager
 
-from fastapi import BackgroundTasks, FastAPI, Request
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
 
 import agent
@@ -26,6 +28,16 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Shared auth dependency — x-webhook-secret header (timing-safe)
+# ---------------------------------------------------------------------------
+
+
+async def require_webhook_secret(x_webhook_secret: str = Header(default="")) -> None:
+    if not WEBHOOK_SECRET or not secrets.compare_digest(x_webhook_secret, WEBHOOK_SECRET):
+        raise HTTPException(status_code=403, detail="Forbidden")
 
 
 # ---------------------------------------------------------------------------
@@ -300,20 +312,19 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks):
 
 
 @app.post("/send")
-async def send_agent_message(request: Request):
+async def send_agent_message(request: Request, _: None = Depends(require_webhook_secret)):
     """
     Called by the agent dashboard when an agent sends a manual reply.
     Validates the webhook secret, sends via WhatsApp, saves with sender='agent'.
     """
-    secret = request.headers.get("x-webhook-secret")
-    if secret != WEBHOOK_SECRET:
-        logger.warning("[WARN] [main] /send rejected — invalid webhook secret")
-        return JSONResponse(content={"error": "Forbidden"}, status_code=403)
-
     body = await request.json()
     customer_phone = body.get("customer_phone")
     message_text = body.get("message")
-    company_id = int(body.get("company_id", 1))
+    raw_company_id = body.get("company_id")
+
+    if raw_company_id is None:
+        return JSONResponse(content={"error": "Missing required field: company_id"}, status_code=400)
+    company_id = int(raw_company_id)
 
     if not customer_phone or not message_text:
         return JSONResponse(content={"error": "Missing fields"}, status_code=400)
@@ -562,12 +573,11 @@ async def process_audio_message(customer_phone: str, media_id: str, mime_type: s
 
 
 @app.post("/api/send-email")
-async def send_email_endpoint(request: Request):
+async def send_email_endpoint(request: Request, _: None = Depends(require_webhook_secret)):
     """
     Send an email via Gmail SMTP.
 
-    No authentication required — this service is internal and not exposed
-    publicly (Railway private networking or same-origin calls only).
+    Protected by x-webhook-secret header — same secret shared across services.
 
     Expected body: { "to": str, "subject": str, "body": str }
     """
@@ -651,11 +661,15 @@ async def booking_confirmed(request: Request):
 
 
 @app.get("/audio/{audio_id}")
-async def serve_audio(audio_id: str):
+async def serve_audio(audio_id: str, _: None = Depends(require_webhook_secret)):
     """
-    Stream a stored voice note. The UUID acts as a capability token —
-    no additional auth needed.
+    Stream a stored voice note. Protected by x-webhook-secret header.
     """
+    try:
+        uuid.UUID(audio_id)
+    except ValueError:
+        return JSONResponse(content={"error": "Not found"}, status_code=404)
+
     row = await database.get_voice_note(audio_id)
     if row is None:
         logger.warning("[WARN] [main] Audio not found — id: %s", audio_id)
