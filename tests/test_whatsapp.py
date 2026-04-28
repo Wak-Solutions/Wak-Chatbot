@@ -35,7 +35,7 @@ class TestSendMessage:
         with patch("httpx.AsyncClient") as MockClient:
             instance = MockClient.return_value.__aenter__.return_value
             instance.post = AsyncMock(return_value=mock_resp)
-            await whatsapp.send_message(to="971501234567", text="Hello")
+            await whatsapp.send_message(to="971501234567", text="Hello", token="test-wa-token", phone_id="1234567890")
         call_kwargs = instance.post.call_args
         url = call_kwargs.kwargs.get("url") or call_kwargs.args[0]
         assert "1234567890" in url  # WHATSAPP_PHONE_ID from env
@@ -47,7 +47,7 @@ class TestSendMessage:
         with patch("httpx.AsyncClient") as MockClient:
             instance = MockClient.return_value.__aenter__.return_value
             instance.post = AsyncMock(return_value=mock_resp)
-            await whatsapp.send_message(to="971501234567", text="Test message")
+            await whatsapp.send_message(to="971501234567", text="Test message", token="test-wa-token", phone_id="1234567890")
         payload = instance.post.call_args.kwargs["json"]
         assert payload["messaging_product"] == "whatsapp"
         assert payload["to"] == "971501234567"
@@ -60,7 +60,7 @@ class TestSendMessage:
         with patch("httpx.AsyncClient") as MockClient:
             instance = MockClient.return_value.__aenter__.return_value
             instance.post = AsyncMock(return_value=mock_resp)
-            await whatsapp.send_message(to="971501234567", text="Hi")
+            await whatsapp.send_message(to="971501234567", text="Hi", token="test-wa-token", phone_id="1234567890")
         headers = instance.post.call_args.kwargs["headers"]
         assert "Authorization" in headers
         assert "Bearer" in headers["Authorization"]
@@ -72,7 +72,7 @@ class TestSendMessage:
             instance = MockClient.return_value.__aenter__.return_value
             instance.post = AsyncMock(return_value=mock_resp)
             with pytest.raises(httpx.HTTPStatusError):
-                await whatsapp.send_message(to="971501234567", text="Hi")
+                await whatsapp.send_message(to="971501234567", text="Hi", token="test-wa-token", phone_id="1234567890")
 
     async def test_succeeds_silently_on_200(self):
         """A 200 response must return None without raising."""
@@ -80,5 +80,5 @@ class TestSendMessage:
         with patch("httpx.AsyncClient") as MockClient:
             instance = MockClient.return_value.__aenter__.return_value
             instance.post = AsyncMock(return_value=mock_resp)
-            result = await whatsapp.send_message(to="971501234567", text="Hi")
+            result = await whatsapp.send_message(to="971501234567", text="Hi", token="test-wa-token", phone_id="1234567890")
         assert result is None

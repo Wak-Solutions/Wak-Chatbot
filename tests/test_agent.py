@@ -78,8 +78,13 @@ class TestGetReply:
         assert reply == "Hello! How can I help?"
         assert meeting_msg is None
 
-    async def test_saves_inbound_and_outbound_messages(self, mock_openai, mock_externals):
-        """Both inbound and outbound messages must be written to memory."""
+    async def test_saves_inbound_message(self, mock_openai, mock_externals):
+        """Inbound message must be written to memory by agent.get_reply.
+
+        Outbound persistence moved to main.py (after whatsapp.send_message
+        succeeds), so a Meta send failure doesn't leave a ghost reply in
+        the dashboard. agent.get_reply only saves the inbound side.
+        """
         from agent import get_reply
 
         with patch("memory.save_message", new=AsyncMock()) as mock_save:
@@ -88,10 +93,14 @@ class TestGetReply:
         calls = mock_save.call_args_list
         directions = [c.kwargs.get("direction") or c.args[1] for c in calls]
         assert "inbound" in directions
-        assert "outbound" in directions
 
     async def test_skip_inbound_save_when_flag_false(self, mock_openai, mock_externals):
-        """With _save_inbound=False only the outbound message is saved."""
+        """With _save_inbound=False, agent.get_reply saves nothing.
+
+        Outbound is persisted by main.py after the WhatsApp send succeeds,
+        not by agent.py — so when the inbound flag is off there should be
+        no save_message calls from this code path at all.
+        """
         from agent import get_reply
 
         with patch("memory.save_message", new=AsyncMock()) as mock_save:
@@ -100,7 +109,6 @@ class TestGetReply:
         calls = mock_save.call_args_list
         directions = [c.kwargs.get("direction") or c.args[1] for c in calls]
         assert "inbound" not in directions
-        assert "outbound" in directions
 
     async def test_meeting_intent_short_circuits_openai(self, mock_openai, mock_externals):
         """When the message contains a meeting keyword, OpenAI is never called."""
@@ -164,9 +172,10 @@ class TestGetReply:
         with patch("agent.notify_dashboard", new=AsyncMock()) as mock_notify:
             await get_reply("971501234567", "I want to speak to an agent", company_id=1)
 
+        # agent.py emits event="human_requested" for human-agent escalation intent.
         escalation_calls = [
             c for c in mock_notify.call_args_list
-            if c.kwargs.get("event") == "escalation" or (c.args and c.args[0] == "escalation")
+            if c.kwargs.get("event") == "human_requested" or (c.args and c.args[0] == "human_requested")
         ]
         assert len(escalation_calls) >= 1
 

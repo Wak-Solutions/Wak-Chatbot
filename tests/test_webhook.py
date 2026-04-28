@@ -67,11 +67,15 @@ class TestWebhookIncomingMessages:
 
     async def test_valid_text_message_returns_200(self, client, mock_conn):
         """Valid signature + text message → 200 returned immediately."""
-        mock_conn.fetchrow.return_value = {"id": 1}  # company lookup
         body = make_text_webhook_payload("971501234567", "hello")
         sig = make_signature(body)
 
         with (
+            patch("database.get_app_secret_by_phone_number_id",
+                  new=AsyncMock(return_value="test-app-secret-32chars-padding000")),
+            patch("database.get_company_by_phone_number_id", new=AsyncMock(return_value=1)),
+            patch("database.get_company_whatsapp_creds",
+                  new=AsyncMock(return_value={"token": "t", "phone_id": "1234567890", "app_secret": "s"})),
             patch("agent.get_reply", new=AsyncMock(return_value=("Hi there!", None))),
             patch("whatsapp.send_message", new=AsyncMock()),
             patch("memory.save_message", new=AsyncMock()),
@@ -89,11 +93,15 @@ class TestWebhookIncomingMessages:
 
     async def test_valid_audio_message_returns_200(self, client, mock_conn):
         """Valid signature + audio message → 200 returned immediately."""
-        mock_conn.fetchrow.return_value = {"id": 1}
         body = make_audio_webhook_payload("971501234567")
         sig = make_signature(body)
 
         with (
+            patch("database.get_app_secret_by_phone_number_id",
+                  new=AsyncMock(return_value="test-app-secret-32chars-padding000")),
+            patch("database.get_company_by_phone_number_id", new=AsyncMock(return_value=1)),
+            patch("database.get_company_whatsapp_creds",
+                  new=AsyncMock(return_value={"token": "t", "phone_id": "1234567890", "app_secret": "s"})),
             patch("transcribe.download_media", new=AsyncMock(return_value=(b"audio", "audio/ogg"))),
             patch("transcribe.transcribe", new=AsyncMock(return_value="hello")),
             patch("database.store_voice_note", new=AsyncMock(return_value="uuid-123")),
@@ -116,14 +124,18 @@ class TestWebhookIncomingMessages:
         payload = {"entry": [{"changes": [{"value": {"metadata": {"phone_number_id": "x"}}}]}]}
         body = json.dumps(payload).encode()
         sig = make_signature(body)
-        resp = await client.post(
-            "/webhook",
-            content=body,
-            headers={
-                "Content-Type": "application/json",
-                "X-Hub-Signature-256": sig,
-            },
-        )
+        with patch(
+            "database.get_app_secret_by_phone_number_id",
+            new=AsyncMock(return_value="test-app-secret-32chars-padding000"),
+        ):
+            resp = await client.post(
+                "/webhook",
+                content=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Hub-Signature-256": sig,
+                },
+            )
         assert resp.status_code == 200
 
     async def test_tampered_body_wrong_sig(self, client):
