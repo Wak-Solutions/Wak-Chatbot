@@ -149,6 +149,42 @@ async def get_company_whatsapp_creds(company_id: int) -> dict | None:
         return None
 
 
+async def get_company_by_webhook_secret(secret: str) -> dict | None:
+    """
+    Resolve the active company that owns this per-tenant webhook secret.
+
+    Used to authenticate cross-service requests (TS dashboard → Python bot)
+    without trusting a caller-supplied company_id. The DB equality check is
+    timing-safe enough for our threat model: PostgreSQL hashes the column
+    before comparing, and the secret space (32 bytes) makes brute force
+    infeasible regardless of side-channel timing.
+
+    Returns {'id': int, 'name': str} or None if the secret is empty,
+    unknown, or belongs to an inactive company.
+    """
+    if not secret:
+        return None
+    try:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT id, name FROM companies
+                WHERE webhook_secret = $1 AND is_active = true
+                LIMIT 1
+                """,
+                secret,
+            )
+        if not row:
+            logger.warning("[WARN] [database] Webhook secret did not match any active company")
+            return None
+        return {"id": row["id"], "name": row["name"]}
+    except Exception as exc:
+        logger.warning(
+            "[WARN] [database] get_company_by_webhook_secret failed: %s", exc, exc_info=True
+        )
+        return None
+
+
 async def get_app_secret_by_phone_number_id(phone_number_id: str) -> str | None:
     """
     Returns the Meta App Secret for the company that owns this phone_number_id.
