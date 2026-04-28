@@ -30,7 +30,7 @@ _company_cache: dict[str, int] = {}
 
 async def create_pool() -> None:
     """
-    Opens a pool of 2–10 reusable connections to Neon.
+    Opens a pool of 2–10 reusable connections to PostgreSQL.
     Called once on FastAPI startup in main.py.
     Strips query parameters from the URL because asyncpg doesn't support them.
     """

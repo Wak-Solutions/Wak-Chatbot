@@ -18,9 +18,9 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = "gpt-4o-mini"
 
 
-# ── Neon (PostgreSQL) ─────────────────────────────────────────────────
+# ── PostgreSQL (Supabase) ─────────────────────────────────────────────
 
-# Full connection string to your Neon database.
+# Full connection string to your Supabase database.
 # asyncpg will use this to open a connection pool when the app starts.
 # Format: postgresql://user:password@host/dbname
 DATABASE_URL = os.getenv("DATABASE_URL")

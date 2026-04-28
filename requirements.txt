@@ -9,7 +9,7 @@ fastapi==0.135.1
 # Uvicorn — the ASGI server that runs FastAPI (standard extras: uvloop, websockets, watchfiles)
 uvicorn==0.41.0
 
-# asyncpg — async PostgreSQL driver for connecting to Neon
+# asyncpg — async PostgreSQL driver
 asyncpg==0.31.0
 
 # openai — the official OpenAI Python client
