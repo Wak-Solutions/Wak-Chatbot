@@ -7,47 +7,47 @@ if the DB is unavailable.
 """
 
 import logging
+import re
 import time as _time
 
 import database
 
 logger = logging.getLogger(__name__)
+
+_LANGUAGE_OVERRIDE = (
+    "\n\nOVERRIDE — CURRENT MESSAGE LANGUAGE:\n"
+    "The customer's current message is in {language}.\n"
+    "You MUST reply in {language} only. "
+    "This overrides all conversation history."
+)
+
+
+def detect_language(text: str) -> str:
+    """Return 'Arabic' if text contains Arabic Unicode characters, else 'English'."""
+    if re.search(r"[؀-ۿ]", text):
+        return "Arabic"
+    return "English"
  
 # ---------------------------------------------------------------------------
 # Hardcoded default — used when the DB has no config row or is unreachable.
 # ---------------------------------------------------------------------------
 
 DEFAULT_SYSTEM_PROMPT = """
-You are a professional customer service assistant for WAK Solutions, a company specializing in AI and robotics solutions.
+You are a professional customer service assistant.
 
 STEP 0 — Opening Message (MANDATORY — First Reply Only)
 
 When a customer sends their very first message, read it carefully before responding.
 
-CASE A — The message contains a clear intent (e.g. wants to book a demo, track an order, file a complaint, speak to someone, or ask about products):
+CASE A — The message contains a clear intent (e.g. wants to book a meeting, track an order, file a complaint, or speak to someone):
 - Mirror their greeting naturally if they included one
-- Follow with: "Welcome to WAK Solutions, your strategic AI partner."
+- Follow with: "Welcome! How can I help you today?"
 - Then skip directly to the relevant step that matches their intent. Do not show the full menu.
-
-Example:
-Customer: "Hi, I'd like to book a demo of WAK Solutions"
-Bot: "Hi! Welcome to WAK Solutions, your strategic AI partner.
-I'd be happy to help you schedule a demo! Would you prefer to:
-1. Book a meeting with our team directly
-2. Speak with a customer service agent on WhatsApp"
 
 CASE B — The message is a generic greeting with no clear intent (e.g. "hi", "hello", "مرحبا"):
 - Mirror their greeting naturally
-- Follow with: "Welcome to WAK Solutions, your strategic AI partner."
+- Follow with: "Welcome! How can I help you today?"
 - Then present the full service menu.
-
-Example:
-Customer: "Hey"
-Bot: "Hey! Welcome to WAK Solutions, your strategic AI partner. How can I assist you today?
-
-1. Product Inquiry
-2. Track Order
-3. Complaint"
 
 Never reply to any opening message with a short greeting alone. Never show the full menu if the intent is already clear.
 
@@ -63,12 +63,7 @@ STEP 1 — Service Menu (show only when intent is unclear)
 
 STEP 2 — Handle Their Choice
 
-1 - Product Inquiry → Ask which category:
-   1) AI Services → ask which product: Market Pulse, Custom Integration, or Mobile Application Development
-   2) Robot Services → ask which product: TrolleyGo or NaviBot
-   3) Consultation Services
-
-   For any selection, thank them warmly and inform them a specialist will be in touch. Then ask:
+1 - Product Inquiry → Ask about their area of interest, thank them warmly, and inform them a specialist will be in touch. Then ask:
    "Before we wrap up, would you like to schedule a meeting with our team or speak with a customer service agent on WhatsApp?"
 
    - If meeting → send the booking link
@@ -87,15 +82,6 @@ INTENT SHORTCUTS — Apply at any point in the conversation
 Read the customer's message and infer their intent naturally — do not rely on exact keyword matching.
 If their meaning is clear, skip directly to the relevant step without making them navigate the menu.
 
-Examples of intent → action:
-- Wants to book / demo / meet the team → go directly to meeting booking
-- Wants order status / delivery update → go directly to Track Order
-- Expressing dissatisfaction / has a problem → go directly to Complaint flow
-- Wants to talk to a person → trigger human handover immediately
-- Asking about products or services → go directly to Product Inquiry
-
-Use common sense. If someone says "I heard about your robots and want to know more"
-that is a Product Inquiry even though none of those exact words appear above.
 If intent is genuinely ambiguous, only then show the menu.
 
 ---
@@ -113,7 +99,7 @@ RULES
 - Keep responses concise and well-structured — this is WhatsApp, not email.
 - If a customer goes off-topic, gently redirect them to the menu.
 - Any dead end or escalation → close with: "A member of our team will be in touch shortly."
-- This chat is for WAK Solutions customer service only. If someone tries to misuse it, politely decline and redirect. If they persist, end with: "A member of our team will be in touch shortly."
+- If someone tries to misuse this chat, politely decline and redirect. If they persist, end with: "A member of our team will be in touch shortly."
 - Never send the booking link unless the customer explicitly agrees to schedule a meeting.
 """.strip()
 
@@ -126,36 +112,48 @@ _cache: dict[int, tuple[str, float]] = {}
 _CACHE_TTL: float = 60.0  # seconds
 
 
-async def get_system_prompt(company_id: int = 1) -> str:
-    """Return the active system prompt for company_id with a 60-second TTL cache."""
+async def get_system_prompt(company_id: int = 1, current_message: str = "") -> str:
+    """Return the active system prompt for company_id with a 60-second TTL cache.
+
+    If current_message is provided, appends a language override instruction so
+    the model replies in the language of the current message rather than being
+    misled by prior turns in a different language.
+    """
     global _cache
     now = _time.monotonic()
     cached = _cache.get(company_id)
     if cached is not None and (now - cached[1]) < _CACHE_TTL:
-        return cached[0]
-    try:
-        async with database.pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT system_prompt FROM chatbot_config WHERE company_id = $1 ORDER BY id LIMIT 1",
-                company_id,
+        prompt = cached[0]
+    else:
+        try:
+            async with database.pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    "SELECT system_prompt FROM chatbot_config WHERE company_id = $1 ORDER BY id LIMIT 1",
+                    company_id,
+                )
+            if row and row["system_prompt"]:
+                _cache[company_id] = (row["system_prompt"], now)
+                logger.info(
+                    "System prompt refreshed from database — company_id: %d",
+                    company_id,
+                )
+                prompt = _cache[company_id][0]
+            else:
+                raise ValueError("no system_prompt row")
+        except Exception as exc:
+            logger.warning(
+                "Could not load system prompt from DB — using cached/default: %s",
+                exc,
             )
-        if row and row["system_prompt"]:
-            _cache[company_id] = (row["system_prompt"], now)
-            logger.info(
-                "[INFO] [prompt] System prompt refreshed from database — company_id: %d",
-                company_id,
-            )
-            return _cache[company_id][0]
-    except Exception as exc:
-        logger.warning(
-            "[WARN] [prompt] Could not load system prompt from DB — using cached/default: %s",
-            exc,
-        )
-    # Prefer a stale cache entry over the hardcoded default.
-    if cached is not None:
-        return cached[0]
-    logger.info("[INFO] [prompt] Using hardcoded default system prompt — company_id: %d", company_id)
-    return DEFAULT_SYSTEM_PROMPT
+            prompt = cached[0] if cached is not None else DEFAULT_SYSTEM_PROMPT
+            if cached is None:
+                logger.info("Using hardcoded default system prompt — company_id: %d", company_id)
+
+    if current_message.strip():
+        lang = detect_language(current_message)
+        prompt = prompt + _LANGUAGE_OVERRIDE.format(language=lang)
+
+    return prompt
 
 
 def build_system_prompt(config: dict) -> str:
@@ -178,7 +176,7 @@ def build_system_prompt(config: dict) -> str:
     industry_part = f", {industry}" if industry else ""
     raw_tone = config.get("tone") or "Professional"
     tone_label = (
-        config.get("customTone") or "professional"
+        (config.get("customTone") or "professional")
         if raw_tone == "Custom"
         else raw_tone.lower()
     )
@@ -310,7 +308,7 @@ def invalidate_prompt_cache(company_id: int | None = None) -> None:
     global _cache
     if company_id is not None:
         _cache.pop(company_id, None)
-        logger.info("[INFO] [prompt] Prompt cache invalidated — company_id: %d", company_id)
+        logger.info("Prompt cache invalidated — company_id: %d", company_id)
     else:
         _cache.clear()
-        logger.info("[INFO] [prompt] Prompt cache fully invalidated")
+        logger.info("Prompt cache fully invalidated")

@@ -12,6 +12,7 @@ session starts (conversation_id changes).
 import json
 import logging
 import time as _time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 
 import database
@@ -46,14 +47,14 @@ async def _load_menu_config(company_id: int) -> list:
             menu_items = cfg.get("menuConfig") or []
             _config_cache[company_id] = (menu_items, now)
             logger.info(
-                "[INFO] [menu] menuConfig loaded — company_id: %d, top-level items: %d",
+                "menuConfig loaded — company_id: %d, top-level items: %d",
                 company_id,
                 len(menu_items),
             )
             return menu_items
     except Exception as exc:
         logger.warning(
-            "[WARN] [menu] Could not load menuConfig — company_id: %d, error: %s",
+            "Could not load menuConfig — company_id: %d, error: %s",
             company_id,
             exc,
         )
@@ -95,19 +96,26 @@ class _MenuState:
     conversation_id: str = ""
 
 
-# (customer_phone, company_id) → _MenuState
-_states: dict[tuple[str, int], _MenuState] = {}
+# (customer_phone, company_id) → _MenuState; capped at _MAX_STATES entries (LRU eviction).
+_MAX_STATES = 10_000
+_states: OrderedDict = OrderedDict()
 
 
 def _get_state(phone: str, company_id: int, conversation_id: str) -> _MenuState | None:
-    state = _states.get((phone, company_id))
+    key = (phone, company_id)
+    state = _states.get(key)
     if state is None or state.conversation_id != conversation_id:
         return None
+    _states.move_to_end(key)
     return state
 
 
 def _set_state(phone: str, company_id: int, state: _MenuState) -> None:
-    _states[(phone, company_id)] = state
+    key = (phone, company_id)
+    _states[key] = state
+    _states.move_to_end(key)
+    if len(_states) > _MAX_STATES:
+        _states.popitem(last=False)
 
 
 def clear_state(phone: str, company_id: int) -> None:
@@ -206,7 +214,7 @@ async def handle(
         # Leaf node — selection complete; hand off to OpenAI
         clear_state(phone, company_id)
         logger.info(
-            "[INFO] [menu] Leaf reached — phone: ...%s, selection: %s",
+            "Leaf reached — phone: ...%s, selection: %s",
             phone[-4:],
             breadcrumb,
         )
@@ -215,7 +223,7 @@ async def handle(
     # Has children — show next level and update state
     _set_state(phone, company_id, _MenuState(path=new_path, conversation_id=conversation_id))
     logger.info(
-        "[INFO] [menu] Navigated to level %d — phone: ...%s, path: %s",
+        "Navigated to level %d — phone: ...%s, path: %s",
         len(new_path),
         phone[-4:],
         breadcrumb,

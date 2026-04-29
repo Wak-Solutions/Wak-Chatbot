@@ -10,6 +10,14 @@ import database
 import memory
 
 
+@pytest.fixture(autouse=True)
+def reset_known_contacts():
+    """Clear the in-process contact cache so each test starts fresh."""
+    memory._known_contacts.clear()
+    yield
+    memory._known_contacts.clear()
+
+
 class TestLoadHistory:
     async def test_returns_empty_list_for_new_customer(self, mock_conn):
         mock_conn.fetch.return_value = []

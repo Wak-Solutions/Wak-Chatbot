@@ -10,7 +10,7 @@ import pytest
 
 import database
 import prompt
-from prompt import DEFAULT_SYSTEM_PROMPT, get_system_prompt, invalidate_prompt_cache
+from prompt import DEFAULT_SYSTEM_PROMPT, detect_language, get_system_prompt, invalidate_prompt_cache
 
 
 @pytest.fixture(autouse=True)
@@ -88,6 +88,60 @@ class TestGetSystemPrompt:
 
         result = await get_system_prompt(company_id=99)
         assert result == "Stale prompt"  # stale is preferred over default
+
+
+class TestDetectLanguage:
+    def test_english_only(self):
+        assert detect_language("hello") == "English"
+
+    def test_arabic_only(self):
+        assert detect_language("مرحبا") == "Arabic"
+
+    def test_mixed_arabic_wins(self):
+        """Arabic characters present → Arabic, even if most text is English."""
+        assert detect_language("hello مرحبا") == "Arabic"
+
+    def test_empty_string(self):
+        assert detect_language("") == "English"
+
+    def test_numbers_and_punctuation(self):
+        assert detect_language("123 !@#") == "English"
+
+
+class TestLanguageOverride:
+    async def test_english_message_appends_english_override(self, mock_conn):
+        mock_conn.fetchrow.return_value = {"system_prompt": "Base prompt"}
+        result = await get_system_prompt(company_id=1, current_message="hello")
+        assert "OVERRIDE" in result
+        assert "English" in result.split("OVERRIDE")[1]
+        assert "Arabic" not in result.split("OVERRIDE")[1]
+
+    async def test_arabic_message_appends_arabic_override(self, mock_conn):
+        mock_conn.fetchrow.return_value = {"system_prompt": "Base prompt"}
+        result = await get_system_prompt(company_id=1, current_message="مرحبا")
+        assert "OVERRIDE" in result
+        assert "Arabic" in result.split("OVERRIDE")[1]
+
+    async def test_no_message_no_override(self, mock_conn):
+        mock_conn.fetchrow.return_value = {"system_prompt": "Base prompt"}
+        result = await get_system_prompt(company_id=1)
+        assert result == "Base prompt"
+        assert "OVERRIDE" not in result
+
+    async def test_override_does_not_pollute_cache(self, mock_conn):
+        """The language override must not be stored in the cache."""
+        mock_conn.fetchrow.return_value = {"system_prompt": "Base prompt"}
+        await get_system_prompt(company_id=1, current_message="hello")
+        # Cache entry must be the raw prompt, not the override-appended version
+        assert prompt._cache[1][0] == "Base prompt"
+
+    async def test_second_call_different_language_gets_correct_override(self, mock_conn):
+        """Two consecutive calls with different languages both get correct overrides."""
+        mock_conn.fetchrow.return_value = {"system_prompt": "Base"}
+        english_result = await get_system_prompt(company_id=1, current_message="hello")
+        arabic_result = await get_system_prompt(company_id=1, current_message="مرحبا")
+        assert "English" in english_result.split("OVERRIDE")[1]
+        assert "Arabic" in arabic_result.split("OVERRIDE")[1]
 
 
 class TestInvalidatePromptCache:

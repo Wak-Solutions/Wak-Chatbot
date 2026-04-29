@@ -40,10 +40,12 @@ def mock_conn():
     conn.fetchrow.return_value = None
     conn.fetch.return_value = []
     conn.execute.return_value = "OK"
-    conn.transaction.return_value = AsyncMock(
-        __aenter__=AsyncMock(return_value=None),
-        __aexit__=AsyncMock(return_value=False),
-    )
+    # transaction() in asyncpg is a synchronous call that returns an async CM.
+    # Use MagicMock (not AsyncMock) so calling it doesn't produce a coroutine.
+    _txn = MagicMock()
+    _txn.__aenter__ = AsyncMock(return_value=None)
+    _txn.__aexit__ = AsyncMock(return_value=False)
+    conn.transaction = MagicMock(return_value=_txn)
     return conn
 
 

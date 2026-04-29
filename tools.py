@@ -1,8 +1,8 @@
 """
 tools.py — OpenAI tool schema definitions for the WAK bot.
 
-Centralised here so that adding a new tool only requires editing one file
-rather than hunting through agent.py.
+Add or remove tools here. Each entry in TOOLS is sent to OpenAI on every
+request; agent.py dispatches to the matching handler by function name.
 """
 
 # OpenAI reads this list and decides when to call each function.

@@ -31,6 +31,14 @@ logger = logging.getLogger(__name__)
 # Reused for every call — no need to recreate on each request.
 client = openai.AsyncOpenAI(api_key=OPENAI_API_KEY)
 
+# Shared HTTP client injected by main.py lifespan.
+_http_client: httpx.AsyncClient | None = None
+
+
+def set_http_client(http_client: httpx.AsyncClient) -> None:
+    global _http_client
+    _http_client = http_client
+
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -48,33 +56,58 @@ async def _resolve_booking_url(
     Reuses an existing unbooked meeting token if one exists, otherwise
     creates a fresh token via the dashboard API. Returns None on failure.
     """
-    # Use a database-level lock to prevent two concurrent instances from both
-    # creating a meeting token for the same customer at the same time.
+    # Use a Postgres advisory lock keyed on (company_id, customer_phone) to
+    # prevent two concurrent webhook deliveries from both creating a token.
+    # SELECT FOR UPDATE only locks existing rows — it does not prevent a race
+    # when the result set is empty. pg_try_advisory_xact_lock is non-blocking:
+    # if another instance holds the lock, we re-query for its token instead.
     conn = await database.pool.acquire()
     try:
         async with conn.transaction():
-            # Re-check inside the transaction with FOR UPDATE so a second
-            # instance racing here will block until this transaction commits.
+            lock_key = hash((company_id, customer_phone)) & 0x7FFFFFFFFFFFFFFF
+            acquired = await conn.fetchval(
+                "SELECT pg_try_advisory_xact_lock($1)", lock_key
+            )
+            if not acquired:
+                # Another instance is mid-creation — return its token if ready.
+                row = await conn.fetchrow(
+                    """
+                    SELECT meeting_token FROM meetings
+                    WHERE customer_phone = $1
+                      AND company_id     = $2
+                      AND status         = 'pending'
+                      AND scheduled_at   IS NULL
+                      AND created_at     >= NOW() - INTERVAL '5 minutes'
+                    ORDER BY created_at DESC LIMIT 1
+                    """,
+                    customer_phone,
+                    company_id,
+                )
+                if row and row["meeting_token"]:
+                    logger.info(
+                        "Advisory lock missed — reusing token — phone: %s",
+                        mask_phone(customer_phone),
+                    )
+                    return f"{DASHBOARD_URL}/book/{row['meeting_token']}"
+                return None
+
+            # Lock acquired — check for an existing token first.
             row = await conn.fetchrow(
                 """
-                SELECT meeting_token
-                FROM meetings
+                SELECT meeting_token FROM meetings
                 WHERE customer_phone = $1
                   AND company_id     = $2
                   AND status         = 'pending'
                   AND scheduled_at   IS NULL
                   AND created_at     >= NOW() - INTERVAL '5 minutes'
-                ORDER BY created_at DESC
-                LIMIT 1
-                FOR UPDATE
+                ORDER BY created_at DESC LIMIT 1
                 """,
                 customer_phone,
                 company_id,
             )
             if row and row["meeting_token"]:
-                # Another instance already created a token — reuse it.
                 logger.info(
-                    "[INFO] [agent] Reusing existing meeting token — phone: %s",
+                    "Reusing existing meeting token — phone: %s",
                     mask_phone(customer_phone),
                 )
                 return f"{DASHBOARD_URL}/book/{row['meeting_token']}"
@@ -84,12 +117,14 @@ async def _resolve_booking_url(
                 secret = await database.get_webhook_secret_by_company_id(company_id)
                 if not secret:
                     logger.error(
-                        "[ERROR] [agent] create-token — no webhook secret for company_id=%d",
+                        "create-token — no webhook secret for company_id=%d",
                         company_id,
                     )
                     return None
-                async with httpx.AsyncClient() as http:
-                    resp = await http.post(
+                _http = _http_client or httpx.AsyncClient(timeout=10.0)
+                _is_temp = _http_client is None
+                try:
+                    resp = await _http.post(
                         f"{DASHBOARD_URL}/api/meetings/create-token",
                         json={"customer_phone": customer_phone},
                         headers={"x-webhook-secret": secret},
@@ -98,13 +133,16 @@ async def _resolve_booking_url(
                     resp.raise_for_status()
                     token = resp.json()["token"]
                     logger.info(
-                        "[INFO] [agent] Meeting token created — phone: %s",
+                        "Meeting token created — phone: %s",
                         mask_phone(customer_phone),
                     )
                     return f"{DASHBOARD_URL}/book/{token}"
+                finally:
+                    if _is_temp:
+                        await _http.aclose()
             except Exception as exc:
                 logger.error(
-                    "[ERROR] [agent] create-token failed — phone: %s, error: %s",
+                    "create-token failed — phone: %s, error: %s",
                     mask_phone(customer_phone),
                     exc,
                 )
@@ -185,7 +223,7 @@ async def get_reply(
         # Outbound is persisted by main.py AFTER whatsapp.send_message succeeds,
         # so a failed Meta send does not leave a ghost message in the dashboard.
         logger.info(
-            "[INFO] [agent] Menu level sent — phone: %s",
+            "Menu level sent — phone: %s",
             mask_phone(customer_phone),
         )
         return _menu_reply, None
@@ -195,7 +233,7 @@ async def get_reply(
     # ── Step 3: Human-agent request check ────────────────────────────────────
     if wants_escalation(new_message, history):
         logger.info(
-            "[INFO] [agent] Human agent requested — phone: %s",
+            "Human agent requested — phone: %s",
             mask_phone(customer_phone),
         )
         await notify_dashboard(
@@ -223,13 +261,13 @@ async def get_reply(
                 )
             # Outbound persisted by main.py after successful send.
             logger.info(
-                "[INFO] [agent] Booking link sent — phone: %s",
+                "Booking link sent — phone: %s",
                 mask_phone(customer_phone),
             )
             return booking_reply, None
 
     # ── Step 5: Build message list ────────────────────────────────────────────
-    system_content = await get_system_prompt(company_id)
+    system_content = await get_system_prompt(company_id, current_message=new_message)
 
     # Append a menu-navigation override so OpenAI only ever shows the top-level
     # items — sub-levels are handled deterministically by menu_nav.handle().
@@ -283,22 +321,31 @@ async def get_reply(
 
     # ── Step 6: First OpenAI call ─────────────────────────────────────────────
     logger.info(
-        "[INFO] [agent] OpenAI request — model: %s, history_len: %d, phone: %s",
+        "OpenAI request — model: %s, history_len: %d, phone: %s",
         OPENAI_MODEL,
         len(history),
         mask_phone(customer_phone),
     )
 
-    response = await client.chat.completions.create(
-        model=OPENAI_MODEL,
-        messages=messages,
-        tools=TOOLS,
-        tool_choice="auto",
-    )
+    try:
+        response = await client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=messages,
+            tools=TOOLS,
+            tool_choice="auto",
+            timeout=30.0,
+        )
+    except openai.APITimeoutError:
+        logger.error(
+            "OpenAI timeout — model: %s, phone: %s",
+            OPENAI_MODEL,
+            mask_phone(customer_phone),
+        )
+        return "I'm taking too long to respond. Please try again in a moment."
 
     usage = response.usage
     logger.info(
-        "[INFO] [agent] OpenAI response — model: %s, prompt_tokens: %s, completion_tokens: %s, phone: %s",
+        "OpenAI response — model: %s, prompt_tokens: %s, completion_tokens: %s, phone: %s",
         OPENAI_MODEL,
         usage.prompt_tokens if usage else "n/a",
         usage.completion_tokens if usage else "n/a",
@@ -316,28 +363,27 @@ async def get_reply(
             function_args = json.loads(tool_call.function.arguments)
 
             logger.info(
-                "[INFO] [agent] Tool call — function: %s, phone: %s",
+                "Tool call — function: %s, phone: %s",
                 function_name,
                 mask_phone(customer_phone),
             )
 
             if function_name == "lookup_order":
-                tool_result = await database.lookup_order(
-                    order_number=function_args["order_number"],
-                    company_id=company_id,
-                )
-            elif function_name == "confirm_meeting_time":
-                await database.update_meeting_time(
-                    meeting_id=function_args["meeting_id"],
-                    agreed_time=function_args["agreed_time"],
-                )
-                tool_result = {
-                    "confirmed": True,
-                    "agreed_time": function_args["agreed_time"],
-                }
+                try:
+                    tool_result = await database.lookup_order(
+                        order_number=function_args["order_number"],
+                        company_id=company_id,
+                    )
+                except Exception as _lookup_exc:
+                    logger.warning(
+                        "lookup_order failed — phone: %s, error: %s",
+                        mask_phone(customer_phone),
+                        _lookup_exc,
+                    )
+                    tool_result = {"error": "Order lookup temporarily unavailable. Please try again."}
             else:
                 logger.warning(
-                    "[WARN] [agent] Unknown tool requested — function: %s", function_name
+                    "Unknown tool requested — function: %s", function_name
                 )
                 tool_result = {"error": f"Unknown tool: {function_name}"}
 
@@ -350,15 +396,24 @@ async def get_reply(
             )
 
         # Second OpenAI call with the tool result included.
-        second_response = await client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=messages,
-            tools=TOOLS,
-            tool_choice="auto",
-        )
+        try:
+            second_response = await client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=messages,
+                tools=TOOLS,
+                tool_choice="auto",
+                timeout=30.0,
+            )
+        except openai.APITimeoutError:
+            logger.error(
+                "OpenAI tool-followup timeout — model: %s, phone: %s",
+                OPENAI_MODEL,
+                mask_phone(customer_phone),
+            )
+            return "I'm taking too long to respond. Please try again in a moment."
         second_usage = second_response.usage
         logger.info(
-            "[INFO] [agent] OpenAI tool-follow-up — model: %s, prompt_tokens: %s, completion_tokens: %s, phone: %s",
+            "OpenAI tool-follow-up — model: %s, prompt_tokens: %s, completion_tokens: %s, phone: %s",
             OPENAI_MODEL,
             second_usage.prompt_tokens if second_usage else "n/a",
             second_usage.completion_tokens if second_usage else "n/a",
@@ -375,7 +430,7 @@ async def get_reply(
         "[Booking Link]" in final_reply or "[BOOKING_LINK]" in final_reply
     ):
         logger.info(
-            "[INFO] [agent] Replacing [BOOKING_LINK] placeholder — phone: %s",
+            "Replacing [BOOKING_LINK] placeholder — phone: %s",
             mask_phone(customer_phone),
         )
         link_url = await _resolve_booking_url(customer_phone, pending_meeting, company_id)
@@ -387,7 +442,7 @@ async def get_reply(
     # Override if OpenAI tried to manually collect a date/time.
     if ai_scheduling_manually(final_reply):
         logger.info(
-            "[INFO] [agent] Overriding manual scheduling attempt — phone: %s",
+            "Overriding manual scheduling attempt — phone: %s",
             mask_phone(customer_phone),
         )
         override_url = await _resolve_booking_url(customer_phone, pending_meeting, company_id)
@@ -408,10 +463,13 @@ async def get_reply(
         )
 
     # ── Step 10: (Re)initialise menu navigation for the next message ──────────
-    # After every LLM reply, reset menu state to top level so the customer can
-    # always navigate by number on their next message.
-    _post_conv_id = await memory.get_conversation_id(customer_phone, company_id)
-    if _post_conv_id:
-        await menu_nav.start(customer_phone, company_id, _post_conv_id)
+    # Only reset menu state when the bot itself presented a numbered list.
+    # Resetting unconditionally caused "1 question about pricing" to be
+    # intercepted by the menu handler instead of going to the LLM.
+    import re as _re
+    if final_reply and _re.search(r"^\d+[\.\)]", final_reply, _re.MULTILINE):
+        _post_conv_id = await memory.get_conversation_id(customer_phone, company_id)
+        if _post_conv_id:
+            await menu_nav.start(customer_phone, company_id, _post_conv_id)
 
     return final_reply, None

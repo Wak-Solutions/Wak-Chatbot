@@ -66,47 +66,6 @@ class TestSendEndpoint:
 
 
 # ---------------------------------------------------------------------------
-# POST /api/send-email
-# ---------------------------------------------------------------------------
-
-
-class TestSendEmailEndpoint:
-    async def test_missing_secret_returns_403(self, client):
-        resp = await client.post(
-            "/api/send-email",
-            json={"to": "a@b.com", "subject": "Hi", "body": "<p>Hello</p>"},
-        )
-        assert resp.status_code == 403
-
-    async def test_wrong_secret_returns_403(self, client):
-        resp = await client.post(
-            "/api/send-email",
-            json={"to": "a@b.com", "subject": "Hi", "body": "<p>Hello</p>"},
-            headers={"x-webhook-secret": BAD_SECRET},
-        )
-        assert resp.status_code == 403
-
-    async def test_valid_request_returns_200(self, client):
-        with patch("email_service.send_email", return_value=True):
-            resp = await client.post(
-                "/api/send-email",
-                json={"to": "a@b.com", "subject": "Hi", "body": "<p>Hello</p>"},
-                headers={"x-webhook-secret": GOOD_SECRET},
-            )
-        assert resp.status_code == 200
-        assert resp.json()["sent"] is True
-
-    async def test_missing_body_fields_returns_400(self, client):
-        with patch("email_service.send_email", return_value=True):
-            resp = await client.post(
-                "/api/send-email",
-                json={"to": "a@b.com"},
-                headers={"x-webhook-secret": GOOD_SECRET},
-            )
-        assert resp.status_code == 400
-
-
-# ---------------------------------------------------------------------------
 # GET /audio/{audio_id}
 # ---------------------------------------------------------------------------
 

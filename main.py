@@ -3,18 +3,18 @@ import hashlib
 import hmac
 import json
 import logging
-import os
 import secrets
 import uuid
 from contextlib import asynccontextmanager
 
+import httpx
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
 
 import agent
 import database
-import email_service
 import memory
+import notifications
 import transcribe as transcribe_mod
 import whatsapp
 from config import VERIFY_TOKEN, WEBHOOK_SECRET
@@ -55,10 +55,15 @@ async def _link_delivery_loop():
         try:
             meetings = await database.get_meetings_to_notify()
             for m in meetings:
-                raw_base = (os.environ.get("APP_URL") or "wak-agent.up.railway.app").rstrip("/")
-                base_url = raw_base if raw_base.startswith("http") else f"https://{raw_base}"
+                app_url = await database.get_company_app_url(m["company_id"])
+                if app_url is None:
+                    logger.error(
+                        "Link delivery — app_url not set for company %d, skipping",
+                        m["company_id"],
+                    )
+                    continue
                 meeting_url = (
-                    f"{base_url}/meeting/{m['meeting_token']}"
+                    f"{app_url}/meeting/{m['meeting_token']}"
                     if m.get("meeting_token")
                     else m["meeting_link"]
                 )
@@ -66,19 +71,19 @@ async def _link_delivery_loop():
                 _creds = await database.get_company_whatsapp_creds(m["company_id"])
                 if _creds is None:
                     logger.error(
-                        "[ERROR] [main] Link delivery — company %d has no WhatsApp creds, skipping",
+                        "Link delivery — company %d has no WhatsApp creds, skipping",
                         m["company_id"],
                     )
                     continue
                 await whatsapp.send_message(to=m["customer_phone"], text=msg, token=_creds["token"], phone_id=_creds["phone_id"])
                 await database.mark_link_sent(m["id"])
                 logger.info(
-                    "[INFO] [main] Meeting link sent — phone: %s, meeting_id: %s",
+                    "Meeting link sent — phone: %s, meeting_id: %s",
                     mask_phone(m["customer_phone"]),
                     m["id"],
                 )
         except Exception as exc:
-            logger.error("[ERROR] [main] Link delivery job error: %s", exc, exc_info=True)
+            logger.error("Link delivery job error: %s", exc, exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -88,21 +93,32 @@ async def _link_delivery_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Creates DB pool on startup, starts link delivery job, closes on shutdown."""
-    logger.info("[INFO] [main] Starting up — creating database connection pool")
+    """Creates DB pool and shared HTTP client on startup, closes on shutdown."""
+    logger.info("Starting up — creating database connection pool")
     await database.create_pool()
-    logger.info("[INFO] [main] Database pool ready")
+    logger.info("Database pool ready")
+
+    http_client = httpx.AsyncClient(
+        timeout=30.0,
+        limits=httpx.Limits(max_connections=20),
+    )
+    whatsapp.set_client(http_client)
+    notifications.set_client(http_client)
+    transcribe_mod.set_client(http_client)
+    agent.set_http_client(http_client)
+
     delivery_task = asyncio.create_task(_link_delivery_loop())
-    logger.info("[INFO] [main] Meeting link delivery job started")
+    logger.info("Meeting link delivery job started")
     yield
     delivery_task.cancel()
     try:
         await delivery_task
     except asyncio.CancelledError:
         pass
-    logger.info("[INFO] [main] Shutting down — closing database connection pool")
+    await http_client.aclose()
+    logger.info("Shutting down — closing database connection pool")
     await database.close_pool()
-    logger.info("[INFO] [main] Database pool closed")
+    logger.info("Database pool closed")
 
 
 app = FastAPI(lifespan=lifespan)
@@ -127,7 +143,7 @@ async def health_check():
             status_code=200,
         )
     except Exception as exc:
-        logger.error("[ERROR] [main] Health check — database unreachable: %s", exc)
+        logger.error("Health check — database unreachable: %s", exc)
         return JSONResponse(
             content={"status": "degraded", "database": "unreachable"},
             status_code=503,
@@ -147,13 +163,13 @@ async def verify_webhook(request: Request):
     token = params.get("hub.verify_token")
     challenge = params.get("hub.challenge")
 
-    logger.info("[INFO] [main] Webhook verification request — mode: %s", mode)
+    logger.info("Webhook verification request — mode: %s", mode)
 
     if mode == "subscribe" and token == VERIFY_TOKEN:
-        logger.info("[INFO] [main] Webhook verified successfully")
+        logger.info("Webhook verified successfully")
         return PlainTextResponse(content=challenge, status_code=200)
 
-    logger.warning("[WARN] [main] Webhook verification failed — token mismatch")
+    logger.warning("Webhook verification failed — token mismatch")
     return PlainTextResponse(content="Forbidden", status_code=403)
 
 
@@ -181,7 +197,7 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks):
 
     signature_header = request.headers.get("X-Hub-Signature-256", "")
     if not signature_header:
-        logger.warning("[WARN] [main] Webhook POST rejected — missing X-Hub-Signature-256 header")
+        logger.warning("Webhook POST rejected — missing X-Hub-Signature-256 header")
         return JSONResponse(content={"error": "Forbidden"}, status_code=403)
 
     try:
@@ -191,18 +207,18 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks):
         _value = _changes[0].get("value", {}) if _changes else {}
         _pnid = _value.get("metadata", {}).get("phone_number_id", "")
     except Exception:
-        logger.warning("[WARN] [main] Webhook POST rejected — malformed JSON body")
-        return JSONResponse(content={"error": "Forbidden"}, status_code=403)
+        logger.warning("Webhook POST dropped — malformed JSON body")
+        return JSONResponse(content={"status": "ok"}, status_code=200)
 
     if not _pnid:
-        logger.info("[INFO] [main] Webhook with no phone_number_id — likely a status update, accepting")
+        logger.info("Webhook with no phone_number_id — likely a status update, accepting")
         # No routing possible and no content to process; return 200 so Meta stops retrying.
         return JSONResponse(content={"status": "ok"}, status_code=200)
 
     app_secret = await database.get_app_secret_by_phone_number_id(_pnid)
     if not app_secret:
         logger.warning(
-            "[WARN] [main] Webhook POST rejected — no app_secret registered for phone_number_id=%s",
+            "Webhook POST rejected — no app_secret registered for phone_number_id=%s",
             _pnid,
         )
         return JSONResponse(content={"error": "Forbidden"}, status_code=403)
@@ -215,7 +231,7 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks):
 
     if not hmac.compare_digest(expected_sig, signature_header):
         logger.warning(
-            "[WARN] [main] Webhook POST rejected — signature mismatch for phone_number_id=%s",
+            "Webhook POST rejected — signature mismatch for phone_number_id=%s",
             _pnid,
         )
         return JSONResponse(content={"error": "Forbidden"}, status_code=403)
@@ -230,7 +246,7 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks):
 
         messages_list = value.get("messages", [])
         if not messages_list:
-            logger.info("[INFO] [main] No messages in payload — likely a status update, ignoring")
+            logger.info("No messages in payload — likely a status update, ignoring")
             return JSONResponse(content={"status": "ok"}, status_code=200)
 
         # Resolve company from the WhatsApp phone_number_id in the webhook metadata.
@@ -245,7 +261,7 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks):
         creds = await database.get_company_whatsapp_creds(company_id)
         if creds is None:
             logger.error(
-                "[ERROR] [main] Company %d has no WhatsApp credentials — cannot send replies",
+                "Company %d has no WhatsApp credentials — cannot send replies",
                 company_id,
             )
             return JSONResponse(content={"status": "no_creds"}, status_code=200)
@@ -255,19 +271,19 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks):
         customer_phone = message.get("from")
 
         if not customer_phone:
-            logger.warning("[WARN] [main] Webhook message missing 'from' field — ignoring")
+            logger.warning("Webhook message missing 'from' field — ignoring")
             return JSONResponse(content={"status": "ok"}, status_code=200)
 
         if msg_type == "text":
             message_text = message.get("text", {}).get("body")
             if not message_text:
                 logger.warning(
-                    "[WARN] [main] Text message with empty body — phone: %s",
+                    "Text message with empty body — phone: %s",
                     mask_phone(customer_phone),
                 )
                 return JSONResponse(content={"status": "ok"}, status_code=200)
             logger.info(
-                "[INFO] [main] Message received — phone: %s, type: text, company_id: %d",
+                "Message received — phone: %s, type: text, company_id: %d",
                 mask_phone(customer_phone),
                 company_id,
             )
@@ -279,12 +295,12 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks):
             mime_type = audio_data.get("mime_type", "audio/ogg")
             if not media_id:
                 logger.warning(
-                    "[WARN] [main] Audio message missing media ID — phone: %s",
+                    "Audio message missing media ID — phone: %s",
                     mask_phone(customer_phone),
                 )
                 return JSONResponse(content={"status": "ok"}, status_code=200)
             logger.info(
-                "[INFO] [main] Message received — phone: %s, type: audio, mime: %s, company_id: %d",
+                "Message received — phone: %s, type: audio, mime: %s, company_id: %d",
                 mask_phone(customer_phone),
                 mime_type,
                 company_id,
@@ -295,13 +311,13 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks):
 
         else:
             logger.info(
-                "[INFO] [main] Unsupported message type — phone: %s, type: %s",
+                "Unsupported message type — phone: %s, type: %s",
                 mask_phone(customer_phone),
                 msg_type,
             )
 
     except (IndexError, KeyError, TypeError) as exc:
-        logger.error("[ERROR] [main] Failed to parse webhook payload: %s", exc, exc_info=True)
+        logger.error("Failed to parse webhook payload: %s", exc, exc_info=True)
 
     return JSONResponse(content={"status": "ok"}, status_code=200)
 
@@ -331,7 +347,7 @@ async def send_agent_message(request: Request, _: None = Depends(require_webhook
 
     creds = await database.get_company_whatsapp_creds(company_id)
     if creds is None:
-        logger.error("[ERROR] [main] /send — company %d has no WhatsApp credentials", company_id)
+        logger.error("/send — company %d has no WhatsApp credentials", company_id)
         return JSONResponse(content={"error": "WhatsApp credentials not configured"}, status_code=503)
 
     try:
@@ -344,18 +360,18 @@ async def send_agent_message(request: Request, _: None = Depends(require_webhook
             company_id=company_id,
         )
         logger.info(
-            "[INFO] [main] Agent message sent — phone: %s, type: text",
+            "Agent message sent — phone: %s, type: text",
             mask_phone(customer_phone),
         )
         return JSONResponse(content={"status": "sent"}, status_code=200)
     except Exception as exc:
         logger.error(
-            "[ERROR] [main] Failed to send agent message — phone: %s, error: %s",
+            "Failed to send agent message — phone: %s, error: %s",
             mask_phone(customer_phone),
             exc,
             exc_info=True,
         )
-        return JSONResponse(content={"error": str(exc)}, status_code=500)
+        return JSONResponse(content={"error": "Internal error"}, status_code=500)
 
 
 # ---------------------------------------------------------------------------
@@ -367,7 +383,7 @@ async def process_message(customer_phone: str, message_text: str, company_id: in
     """Generate and send a bot reply for an inbound text message."""
     try:
         logger.info(
-            "[INFO] [main] Processing text message — phone: %s",
+            "Processing text message — phone: %s",
             mask_phone(customer_phone),
         )
 
@@ -386,7 +402,7 @@ async def process_message(customer_phone: str, message_text: str, company_id: in
             company_id=company_id,
         )
         logger.info(
-            "[INFO] [main] Reply sent — phone: %s, type: text",
+            "Reply sent — phone: %s, type: text",
             mask_phone(customer_phone),
         )
 
@@ -400,13 +416,13 @@ async def process_message(customer_phone: str, message_text: str, company_id: in
                 company_id=company_id,
             )
             logger.info(
-                "[INFO] [main] Meeting invitation sent — phone: %s",
+                "Meeting invitation sent — phone: %s",
                 mask_phone(customer_phone),
             )
 
     except Exception as exc:
         logger.error(
-            "[ERROR] [main] Failed to process text message — phone: %s, error: %s",
+            "Failed to process text message — phone: %s, error: %s",
             mask_phone(customer_phone),
             exc,
             exc_info=True,
@@ -424,7 +440,7 @@ async def process_audio_message(customer_phone: str, media_id: str, mime_type: s
     """
     try:
         logger.info(
-            "[INFO] [main] Processing voice note — phone: %s, mime: %s",
+            "Processing voice note — phone: %s, mime: %s",
             mask_phone(customer_phone),
             mime_type,
         )
@@ -435,7 +451,7 @@ async def process_audio_message(customer_phone: str, media_id: str, mime_type: s
         except ValueError as exc:
             if "too large" in str(exc).lower():
                 logger.warning(
-                    "[WARN] [main] Voice note rejected (too large) — phone: %s",
+                    "Voice note rejected (too large) — phone: %s",
                     mask_phone(customer_phone),
                 )
                 await whatsapp.send_message(
@@ -454,16 +470,21 @@ async def process_audio_message(customer_phone: str, media_id: str, mime_type: s
 
         # Step 2: Store audio in DB
         audio_id = await database.store_voice_note(audio_bytes, actual_mime, company_id)
-        raw_base = (os.environ.get("APP_URL") or "wak-agent.up.railway.app").rstrip("/")
-        base_url = raw_base if raw_base.startswith("http") else f"https://{raw_base}"
-        media_url = f"{base_url}/api/voice-notes/{audio_id}"
+        app_url = await database.get_company_app_url(company_id)
+        if app_url is None:
+            logger.error(
+                "Audio handling — app_url not set for company %d, cannot build media_url",
+                company_id,
+            )
+            return
+        media_url = f"{app_url}/api/voice-notes/{audio_id}"
 
         # Step 3: Transcribe
         try:
             transcription = await transcribe_mod.transcribe(audio_bytes, actual_mime)
         except Exception as exc:
             logger.error(
-                "[ERROR] [main] Whisper transcription failed — phone: %s, error: %s",
+                "Whisper transcription failed — phone: %s, error: %s",
                 mask_phone(customer_phone),
                 exc,
                 exc_info=True,
@@ -491,7 +512,7 @@ async def process_audio_message(customer_phone: str, media_id: str, mime_type: s
 
         if not transcription:
             logger.info(
-                "[INFO] [main] Whisper returned empty transcription — phone: %s",
+                "Whisper returned empty transcription — phone: %s",
                 mask_phone(customer_phone),
             )
             await memory.save_message(
@@ -544,7 +565,7 @@ async def process_audio_message(customer_phone: str, media_id: str, mime_type: s
             company_id=company_id,
         )
         logger.info(
-            "[INFO] [main] Reply sent after voice note — phone: %s, type: text",
+            "Reply sent after voice note — phone: %s, type: text",
             mask_phone(customer_phone),
         )
 
@@ -560,99 +581,11 @@ async def process_audio_message(customer_phone: str, media_id: str, mime_type: s
 
     except Exception as exc:
         logger.error(
-            "[ERROR] [main] Failed to process voice note — phone: %s, error: %s",
+            "Failed to process voice note — phone: %s, error: %s",
             mask_phone(customer_phone),
             exc,
             exc_info=True,
         )
-
-
-# ---------------------------------------------------------------------------
-# Generic send-email endpoint (called by the Node.js dashboard)
-# ---------------------------------------------------------------------------
-
-
-@app.post("/api/send-email")
-async def send_email_endpoint(request: Request, _: None = Depends(require_webhook_secret)):
-    """
-    Send an email via Gmail SMTP.
-
-    Protected by x-webhook-secret header — same secret shared across services.
-
-    Expected body: { "to": str, "subject": str, "body": str }
-    """
-    body = await request.json()
-    to = (body.get("to") or "").strip()
-    subject = (body.get("subject") or "").strip()
-    html_body = (body.get("body") or "").strip()
-
-    print(f"[SEND-EMAIL] endpoint hit — to={to}, subject={subject}", flush=True)
-
-    if not to or not subject or not html_body:
-        return JSONResponse(
-            content={"error": "Missing required fields: to, subject, body"},
-            status_code=400,
-        )
-
-    ok = email_service.send_email(to=to, subject=subject, html_body=html_body)
-    return JSONResponse(content={"sent": ok}, status_code=200)
-
-
-# ---------------------------------------------------------------------------
-# Internal: booking confirmation email (called by the Node.js dashboard)
-# ---------------------------------------------------------------------------
-
-
-@app.post("/internal/booking-confirmed")
-async def booking_confirmed(request: Request):
-    """
-    Called by the Node.js server after a meeting slot is confirmed.
-    Sends a booking confirmation email to the customer.
-
-    Protected by x-webhook-secret header — same secret shared across services.
-
-    Expected body:
-      {
-        "to": "customer@example.com",
-        "customer_name": "Ahmed",
-        "meeting_time": "Mon 21 Apr 2026 at 10:00 AST",
-        "meeting_link": "https://wak.daily.co/abc123",
-        "agent_name": "WAK Solutions Team"   // optional
-      }
-    """
-    print("[BOOKING-CONFIRMED] endpoint hit", flush=True)
-    secret = request.headers.get("x-webhook-secret")
-    if secret != WEBHOOK_SECRET:
-        logger.warning("[WARN] [main] /internal/booking-confirmed rejected — invalid secret")
-        print("[BOOKING-CONFIRMED] rejected — invalid secret", flush=True)
-        return JSONResponse(content={"error": "Forbidden"}, status_code=403)
-
-    body = await request.json()
-    to = (body.get("to") or "").strip()
-    print(f"[BOOKING-CONFIRMED] payload received — to={to}", flush=True)
-    customer_name = (body.get("customer_name") or "there").strip()
-    meeting_time = (body.get("meeting_time") or "").strip()
-    meeting_link = (body.get("meeting_link") or "").strip()
-    agent_name = (body.get("agent_name") or "WAK Solutions Team").strip()
-
-    if not to or not meeting_time or not meeting_link:
-        return JSONResponse(
-            content={"error": "Missing required fields: to, meeting_time, meeting_link"},
-            status_code=400,
-        )
-
-    html = email_service.build_booking_confirmation_html(
-        customer_name=customer_name,
-        meeting_time=meeting_time,
-        meeting_link=meeting_link,
-        agent_name=agent_name,
-    )
-    ok = email_service.send_email(
-        to=to,
-        subject="Your meeting with WAK Solutions is confirmed",
-        html_body=html,
-    )
-    return JSONResponse(content={"sent": ok}, status_code=200)
 
 
 # ---------------------------------------------------------------------------
@@ -672,7 +605,7 @@ async def serve_audio(audio_id: str, _: None = Depends(require_webhook_secret)):
 
     row = await database.get_voice_note(audio_id)
     if row is None:
-        logger.warning("[WARN] [main] Audio not found — id: %s", audio_id)
+        logger.warning("Audio not found — id: %s", audio_id)
         return JSONResponse(content={"error": "Not found"}, status_code=404)
     return Response(
         content=row["audio_data"],

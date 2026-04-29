@@ -5,6 +5,27 @@ All functions here are stateless and have zero side effects.
 They can be unit-tested without importing OpenAI, database, or httpx.
 """
 
+import re
+
+# ---------------------------------------------------------------------------
+# Matching helpers
+# ---------------------------------------------------------------------------
+
+
+def _kw_match(keyword: str, text: str) -> bool:
+    """
+    Return True if keyword appears in text.
+
+    Single-word ASCII keywords use word-boundary regex to avoid substring
+    false positives ("book" in "Facebook", "agent" in "management").
+    Multi-word phrases and non-ASCII (Arabic) use plain substring matching
+    because \b is unreliable for Unicode and phrase boundaries are explicit.
+    """
+    if " " in keyword or not keyword.isascii():
+        return keyword in text
+    return bool(re.search(r"\b" + re.escape(keyword) + r"\b", text))
+
+
 # ---------------------------------------------------------------------------
 # Keyword sets
 # ---------------------------------------------------------------------------
@@ -104,8 +125,8 @@ def wants_meeting(message: str, history: list | None = None) -> bool:
     the meeting-or-agent question, to avoid false positives.
     """
     lower = message.lower()
-    if any(kw in lower for kw in _MEETING_KEYWORDS):
-        matched = {kw for kw in _MEETING_KEYWORDS if kw in lower}
+    if any(_kw_match(kw, lower) for kw in _MEETING_KEYWORDS):
+        matched = {kw for kw in _MEETING_KEYWORDS if _kw_match(kw, lower)}
         non_ambiguous = matched - _AMBIGUOUS_AFFIRMATIVES
         if non_ambiguous:
             return True
@@ -122,10 +143,10 @@ def wants_escalation(message: str, history: list | None = None) -> bool:
     Ambiguous affirmatives only count when the bot just offered the agent option.
     """
     lower = message.lower()
-    if any(kw in lower for kw in _ESCALATION_KEYWORDS):
+    if any(_kw_match(kw, lower) for kw in _ESCALATION_KEYWORDS):
         return True
     # Ambiguous affirmatives only count with agent-offer context.
-    if any(kw in lower for kw in _AMBIGUOUS_AFFIRMATIVES):
+    if any(_kw_match(kw, lower) for kw in _AMBIGUOUS_AFFIRMATIVES):
         if history and _bot_just_offered_agent(history):
             return True
     return False

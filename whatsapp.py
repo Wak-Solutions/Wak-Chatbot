@@ -6,13 +6,18 @@ import logging
 
 import httpx
 
+from notifications import mask_phone as _mask_phone
+
 logger = logging.getLogger(__name__)
 
+# Shared client injected by main.py lifespan. Falls back to a per-call client
+# only when running outside the FastAPI app (e.g. tests).
+_http_client: httpx.AsyncClient | None = None
 
-def _mask_phone(phone: str) -> str:
-    if not phone or len(phone) < 4:
-        return "****"
-    return f"****{phone[-4:]}"
+
+def set_client(client: httpx.AsyncClient) -> None:
+    global _http_client
+    _http_client = client
 
 
 async def send_message(to: str, text: str, *, token: str, phone_id: str) -> None:
@@ -41,23 +46,28 @@ async def send_message(to: str, text: str, *, token: str, phone_id: str) -> None
     }
 
     logger.info(
-        "[INFO] [whatsapp] Sending message — phone: %s, phone_id: %s",
+        "Sending message — phone: %s, phone_id: %s",
         _mask_phone(to),
         phone_id,
     )
 
-    async with httpx.AsyncClient() as client:
-        response = await client.post(url=url, headers=headers, json=payload, timeout=10.0)
+    _client = _http_client or httpx.AsyncClient(timeout=10.0)
+    _is_temp = _http_client is None
+    try:
+        response = await _client.post(url=url, headers=headers, json=payload, timeout=10.0)
+    finally:
+        if _is_temp:
+            await _client.aclose()
 
     if response.is_success:
         logger.info(
-            "[INFO] [whatsapp] Message sent — phone: %s, status: %d",
+            "Message sent — phone: %s, status: %d",
             _mask_phone(to),
             response.status_code,
         )
     else:
         logger.error(
-            "[ERROR] [whatsapp] Send failed — phone: %s, status: %d, body: %s",
+            "Send failed — phone: %s, status: %d, body: %s",
             _mask_phone(to),
             response.status_code,
             response.text[:200],

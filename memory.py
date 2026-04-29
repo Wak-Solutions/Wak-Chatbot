@@ -7,14 +7,14 @@ import uuid
 
 import database
 from config import MEMORY_WINDOW
+from notifications import mask_phone as _mask_phone
 
 logger = logging.getLogger(__name__)
 
-
-def _mask_phone(phone: str) -> str:
-    if not phone or len(phone) < 4:
-        return "****"
-    return f"****{phone[-4:]}"
+# Process-scoped set keyed by "{company_id}:{phone}".
+# Avoids a DB round-trip for the ON CONFLICT DO NOTHING upsert on every inbound message.
+# Resets on process restart — the DB upsert handles that case correctly.
+_known_contacts: set[str] = set()
 
 
 async def load_history(customer_phone: str, company_id: int = 1) -> list[dict]:
@@ -48,7 +48,7 @@ async def load_history(customer_phone: str, company_id: int = 1) -> list[dict]:
 
         if not rows:
             logger.info(
-                "[INFO] [memory] No history found (new customer) — phone: %s",
+                "No history found (new customer) — phone: %s",
                 _mask_phone(customer_phone),
             )
             return []
@@ -61,7 +61,7 @@ async def load_history(customer_phone: str, company_id: int = 1) -> list[dict]:
             for row in rows
         ]
         logger.info(
-            "[INFO] [memory] History loaded — phone: %s, messages: %d",
+            "History loaded — phone: %s, messages: %d",
             _mask_phone(customer_phone),
             len(history),
         )
@@ -69,7 +69,7 @@ async def load_history(customer_phone: str, company_id: int = 1) -> list[dict]:
 
     except Exception as exc:
         logger.error(
-            "[ERROR] [memory] load_history failed — phone: %s, error: %s",
+            "load_history failed — phone: %s, error: %s",
             _mask_phone(customer_phone),
             exc,
             exc_info=True,
@@ -98,7 +98,7 @@ async def get_conversation_id(customer_phone: str, company_id: int) -> str | Non
         return str(row["conversation_id"]) if row else None
     except Exception as exc:
         logger.error(
-            "[ERROR] [memory] get_conversation_id failed — phone: %s, error: %s",
+            "get_conversation_id failed — phone: %s, error: %s",
             _mask_phone(customer_phone),
             exc,
         )
@@ -133,19 +133,28 @@ async def save_message(
 
     try:
         async with database.pool.acquire() as conn:
-            # Resolve conversation_id: reuse if within 24 hours, else start a new session
-            row = await conn.fetchrow(
-                """
-                SELECT conversation_id FROM messages
-                WHERE customer_phone = $1 AND company_id = $2
-                  AND conversation_id IS NOT NULL
-                  AND created_at > NOW() - INTERVAL '24 hours'
-                ORDER BY created_at DESC LIMIT 1
-                """,
-                customer_phone,
-                company_id,
-            )
-            conversation_id = str(row["conversation_id"]) if row else str(uuid.uuid4())
+            # Advisory lock on (company_id, customer_phone) prevents two
+            # near-simultaneous inbound messages from generating two different
+            # conversation_ids and splitting one session into two.
+            # SELECT-then-INSERT in two statements would be race-prone.
+            lock_key = hash((company_id, customer_phone)) & 0x7FFFFFFFFFFFFFFF
+            async with conn.transaction():
+                await conn.fetchval(
+                    "SELECT pg_advisory_xact_lock($1)", lock_key
+                )
+                # Resolve conversation_id: reuse if within 24 hours, else start a new session
+                row = await conn.fetchrow(
+                    """
+                    SELECT conversation_id FROM messages
+                    WHERE customer_phone = $1 AND company_id = $2
+                      AND conversation_id IS NOT NULL
+                      AND created_at > NOW() - INTERVAL '24 hours'
+                    ORDER BY created_at DESC LIMIT 1
+                    """,
+                    customer_phone,
+                    company_id,
+                )
+                conversation_id = str(row["conversation_id"]) if row else str(uuid.uuid4())
 
             await conn.execute(
                 """
@@ -166,7 +175,7 @@ async def save_message(
                 conversation_id,
             )
         logger.info(
-            "[INFO] [memory] Message saved — phone: %s, direction: %s, sender: %s, media_type: %s",
+            "Message saved — phone: %s, direction: %s, sender: %s, media_type: %s",
             _mask_phone(customer_phone),
             direction,
             sender,
@@ -174,7 +183,7 @@ async def save_message(
         )
     except Exception as exc:
         logger.error(
-            "[ERROR] [memory] save_message failed — phone: %s, direction: %s, error: %s",
+            "save_message failed — phone: %s, direction: %s, error: %s",
             _mask_phone(customer_phone),
             direction,
             exc,
@@ -183,5 +192,9 @@ async def save_message(
         raise
 
     # Auto-add customer to contacts on first inbound message.
+    # Skip the DB round-trip if we've already seen this phone in this process.
     if direction == "inbound":
-        await database.auto_capture_contact(customer_phone, company_id)
+        _key = f"{company_id}:{customer_phone}"
+        if _key not in _known_contacts:
+            await database.auto_capture_contact(customer_phone, company_id)
+            _known_contacts.add(_key)

@@ -12,6 +12,14 @@ from config import OPENAI_API_KEY
 
 logger = logging.getLogger(__name__)
 
+_http_client: httpx.AsyncClient | None = None
+
+
+def set_client(client: httpx.AsyncClient) -> None:
+    global _http_client
+    _http_client = client
+
+
 _GRAPH_VERSION = "v21.0"
 
 # Whisper hard limit is 25 MB. WhatsApp's own limit for voice notes is 16 MB,
@@ -58,9 +66,11 @@ async def download_media(media_id: str, *, token: str) -> tuple[bytes, str]:
     """
     auth_headers = {"Authorization": f"Bearer {token}"}
 
-    async with httpx.AsyncClient() as client:
+    _client = _http_client or httpx.AsyncClient()
+    _is_temp = _http_client is None
+    try:
         # Step 1 — resolve the media ID to a CDN URL
-        meta_resp = await client.get(
+        meta_resp = await _client.get(
             f"https://graph.facebook.com/{_GRAPH_VERSION}/{media_id}",
             headers=auth_headers,
             timeout=10.0,
@@ -73,7 +83,7 @@ async def download_media(media_id: str, *, token: str) -> tuple[bytes, str]:
         file_size = meta.get("file_size", 0)
 
         logger.info(
-            "[INFO] [transcribe] Media metadata — media_id: %s, mime: %s, size_bytes: %s",
+            "Media metadata — media_id: %s, mime: %s, size_bytes: %s",
             media_id,
             mime_type,
             file_size or "unknown",
@@ -84,7 +94,7 @@ async def download_media(media_id: str, *, token: str) -> tuple[bytes, str]:
 
         if file_size and file_size > _MAX_AUDIO_BYTES:
             logger.warning(
-                "[WARN] [transcribe] Audio too large before download — size_bytes: %d, limit: %d",
+                "Audio too large before download — size_bytes: %d, limit: %d",
                 file_size,
                 _MAX_AUDIO_BYTES,
             )
@@ -93,7 +103,7 @@ async def download_media(media_id: str, *, token: str) -> tuple[bytes, str]:
             )
 
         # Step 2 — download the audio bytes
-        audio_resp = await client.get(
+        audio_resp = await _client.get(
             cdn_url,
             headers=auth_headers,
             timeout=30.0,
@@ -101,10 +111,13 @@ async def download_media(media_id: str, *, token: str) -> tuple[bytes, str]:
         )
         audio_resp.raise_for_status()
         audio_bytes = audio_resp.content
+    finally:
+        if _is_temp:
+            await _client.aclose()
 
     if len(audio_bytes) > _MAX_AUDIO_BYTES:
         logger.warning(
-            "[WARN] [transcribe] Audio too large after download — size_bytes: %d, limit: %d",
+            "Audio too large after download — size_bytes: %d, limit: %d",
             len(audio_bytes),
             _MAX_AUDIO_BYTES,
         )
@@ -113,7 +126,7 @@ async def download_media(media_id: str, *, token: str) -> tuple[bytes, str]:
         )
 
     logger.info(
-        "[INFO] [transcribe] Audio downloaded — media_id: %s, size_bytes: %d, mime: %s",
+        "Audio downloaded — media_id: %s, size_bytes: %d, mime: %s",
         media_id,
         len(audio_bytes),
         mime_type,
@@ -137,7 +150,7 @@ async def transcribe(audio_bytes: bytes, mime_type: str) -> str:
     size_bytes = len(audio_bytes)
 
     logger.info(
-        "[INFO] [transcribe] Whisper request — model: whisper-1, size_bytes: %d, ext: %s",
+        "Whisper request — model: whisper-1, size_bytes: %d, ext: %s",
         size_bytes,
         ext,
     )
@@ -154,20 +167,20 @@ async def transcribe(audio_bytes: bytes, mime_type: str) -> str:
 
         if text:
             logger.info(
-                "[INFO] [transcribe] Whisper success — model: whisper-1, size_bytes: %d, result_chars: %d",
+                "Whisper success — model: whisper-1, size_bytes: %d, result_chars: %d",
                 size_bytes,
                 len(text),
             )
         else:
             logger.info(
-                "[INFO] [transcribe] Whisper returned empty transcription — model: whisper-1, size_bytes: %d",
+                "Whisper returned empty transcription — model: whisper-1, size_bytes: %d",
                 size_bytes,
             )
         return text
 
     except Exception as exc:
         logger.error(
-            "[ERROR] [transcribe] Whisper failed — model: whisper-1, size_bytes: %d, error: %s",
+            "Whisper failed — model: whisper-1, size_bytes: %d, error: %s",
             size_bytes,
             exc,
             exc_info=True,

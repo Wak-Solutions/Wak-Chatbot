@@ -7,6 +7,7 @@ message handler to resolve the company from the WhatsApp phone number ID.
 """
 
 import logging
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -19,8 +20,10 @@ logger = logging.getLogger(__name__)
 # Holds the pool once created by main.py on startup.
 pool: asyncpg.Pool | None = None
 
-# In-process cache: phone_number_id → company_id (avoids a DB round-trip per message)
-_company_cache: dict[str, int] = {}
+# In-process cache: phone_number_id → (company_id, monotonic_timestamp).
+# TTL bounds staleness if a phone_number_id is ever reassigned.
+_company_cache: dict[str, tuple[int, float]] = {}
+_COMPANY_CACHE_TTL = 300.0  # seconds
 
 
 # ---------------------------------------------------------------------------
@@ -44,9 +47,9 @@ async def create_pool() -> None:
             max_size=10,
             statement_cache_size=0,
         )
-        logger.info("[INFO] [database] Connection pool created — min: 2, max: 10")
+        logger.info("Connection pool created — min: 2, max: 10")
     except Exception as exc:
-        logger.error("[ERROR] [database] Failed to create connection pool: %s", exc, exc_info=True)
+        logger.error("Failed to create connection pool: %s", exc, exc_info=True)
         raise
 
 
@@ -55,7 +58,7 @@ async def close_pool() -> None:
     global pool
     if pool:
         await pool.close()
-        logger.info("[INFO] [database] Connection pool closed")
+        logger.info("Connection pool closed")
 
 
 # ---------------------------------------------------------------------------
@@ -74,8 +77,11 @@ async def get_company_by_phone_number_id(phone_number_id: str) -> int | None:
     company_id=1: silently routing unmatched messages to a default company
     causes cross-tenant data leakage.
     """
-    if phone_number_id in _company_cache:
-        return _company_cache[phone_number_id]
+    cached = _company_cache.get(phone_number_id)
+    if cached is not None:
+        cached_id, cached_at = cached
+        if (time.monotonic() - cached_at) < _COMPANY_CACHE_TTL:
+            return cached_id
 
     try:
         async with pool.acquire() as conn:
@@ -89,7 +95,7 @@ async def get_company_by_phone_number_id(phone_number_id: str) -> int | None:
             )
         if not row:
             logger.error(
-                "[ERROR] [database] Unroutable webhook — no company owns phone_number_id=%s. "
+                "Unroutable webhook — no company owns phone_number_id=%s. "
                 "Message will be discarded. Register this number in the company's WhatsApp settings.",
                 phone_number_id,
             )
@@ -98,15 +104,15 @@ async def get_company_by_phone_number_id(phone_number_id: str) -> int | None:
 
         company_id = row["id"]
         logger.info(
-            "[INFO] [database] Resolved company_id=%d for phone_number_id=%s",
+            "Resolved company_id=%d for phone_number_id=%s",
             company_id,
             phone_number_id,
         )
-        _company_cache[phone_number_id] = company_id
+        _company_cache[phone_number_id] = (company_id, time.monotonic())
         return company_id
     except Exception as exc:
         logger.error(
-            "[ERROR] [database] get_company_by_phone_number_id failed for phone_number_id=%s: %s",
+            "get_company_by_phone_number_id failed for phone_number_id=%s: %s",
             phone_number_id,
             exc,
             exc_info=True,
@@ -133,7 +139,7 @@ async def get_company_whatsapp_creds(company_id: int) -> dict | None:
             )
         if not row or not row["whatsapp_token"] or not row["whatsapp_phone_number_id"]:
             logger.error(
-                "[ERROR] [database] Company %d has no WhatsApp credentials configured", company_id
+                "Company %d has no WhatsApp credentials configured", company_id
             )
             return None
         return {
@@ -143,7 +149,7 @@ async def get_company_whatsapp_creds(company_id: int) -> dict | None:
         }
     except Exception as exc:
         logger.error(
-            "[ERROR] [database] get_company_whatsapp_creds failed — company_id: %d, error: %s",
+            "get_company_whatsapp_creds failed — company_id: %d, error: %s",
             company_id, exc, exc_info=True,
         )
         return None
@@ -175,12 +181,12 @@ async def get_company_by_webhook_secret(secret: str) -> dict | None:
                 secret,
             )
         if not row:
-            logger.warning("[WARN] [database] Webhook secret did not match any active company")
+            logger.warning("Webhook secret did not match any active company")
             return None
         return {"id": row["id"], "name": row["name"]}
     except Exception as exc:
         logger.warning(
-            "[WARN] [database] get_company_by_webhook_secret failed: %s", exc, exc_info=True
+            "get_company_by_webhook_secret failed: %s", exc, exc_info=True
         )
         return None
 
@@ -201,7 +207,34 @@ async def get_webhook_secret_by_company_id(company_id: int) -> str | None:
         return row["webhook_secret"] if row else None
     except Exception as exc:
         logger.warning(
-            "[WARN] [database] get_webhook_secret_by_company_id failed — company_id: %d, error: %s",
+            "get_webhook_secret_by_company_id failed — company_id: %d, error: %s",
+            company_id, exc, exc_info=True,
+        )
+        return None
+
+
+async def get_company_app_url(company_id: int) -> str | None:
+    """
+    Returns the app_url for the given company, or None if not set.
+    Callers must treat None as a hard error — never fall back to a hardcoded URL.
+    """
+    try:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT app_url FROM companies WHERE id = $1 LIMIT 1",
+                company_id,
+            )
+        if not row or not row["app_url"]:
+            logger.error(
+                "companies.app_url is not set for company_id=%d — "
+                "set it in the branding settings before enabling this tenant",
+                company_id,
+            )
+            return None
+        return row["app_url"].rstrip("/")
+    except Exception as exc:
+        logger.error(
+            "get_company_app_url failed — company_id: %d, error: %s",
             company_id, exc, exc_info=True,
         )
         return None
@@ -221,7 +254,7 @@ async def get_app_secret_by_phone_number_id(phone_number_id: str) -> str | None:
         return row["whatsapp_app_secret"] if row else None
     except Exception as exc:
         logger.error(
-            "[ERROR] [database] get_app_secret_by_phone_number_id failed: %s", exc, exc_info=True,
+            "get_app_secret_by_phone_number_id failed: %s", exc, exc_info=True,
         )
         return None
 
@@ -248,10 +281,10 @@ async def lookup_order(order_number: str, company_id: int = 1) -> dict:
                 company_id,
             )
         if row is None:
-            logger.info("[INFO] [database] Order not found — order_number: %s", order_number)
+            logger.info("Order not found — order_number: %s", order_number)
             return {"found": False, "message": f"No order found with number {order_number}."}
         logger.info(
-            "[INFO] [database] Order lookup success — order_number: %s, status: %s",
+            "Order lookup success — order_number: %s, status: %s",
             order_number,
             row["status"],
         )
@@ -264,7 +297,7 @@ async def lookup_order(order_number: str, company_id: int = 1) -> dict:
         }
     except Exception as exc:
         logger.error(
-            "[ERROR] [database] lookup_order failed — order_number: %s, error: %s",
+            "lookup_order failed — order_number: %s, error: %s",
             order_number,
             exc,
             exc_info=True,
@@ -297,10 +330,10 @@ async def create_meeting_with_token(customer_phone: str, company_id: int = 1) ->
                 expires_at,
                 company_id,
             )
-        logger.info("[INFO] [database] Meeting token created — token: %s", token[:8] + "...")
+        logger.info("Meeting token created — token: %s", token[:8] + "...")
         return token
     except Exception as exc:
-        logger.error("[ERROR] [database] create_meeting_with_token failed: %s", exc, exc_info=True)
+        logger.error("create_meeting_with_token failed: %s", exc, exc_info=True)
         raise
 
 
@@ -332,7 +365,7 @@ async def get_pending_meeting(customer_phone: str, company_id: int = 1) -> dict 
         }
     except Exception as exc:
         logger.error(
-            "[ERROR] [database] get_pending_meeting failed: %s", exc, exc_info=True
+            "get_pending_meeting failed: %s", exc, exc_info=True
         )
         raise
 
@@ -347,13 +380,13 @@ async def update_meeting_time(meeting_id: int, agreed_time: str) -> None:
                 meeting_id,
             )
         logger.info(
-            "[INFO] [database] Meeting time updated — meeting_id: %d, agreed_time: %s",
+            "Meeting time updated — meeting_id: %d, agreed_time: %s",
             meeting_id,
             agreed_time,
         )
     except Exception as exc:
         logger.error(
-            "[ERROR] [database] update_meeting_time failed — meeting_id: %d, error: %s",
+            "update_meeting_time failed — meeting_id: %d, error: %s",
             meeting_id,
             exc,
             exc_info=True,
@@ -383,12 +416,12 @@ async def get_meetings_to_notify() -> list[dict]:
         result = [dict(r) for r in rows]
         if result:
             logger.info(
-                "[INFO] [database] Meetings to notify — count: %d", len(result)
+                "Meetings to notify — count: %d", len(result)
             )
         return result
     except Exception as exc:
         logger.error(
-            "[ERROR] [database] get_meetings_to_notify failed: %s", exc, exc_info=True
+            "get_meetings_to_notify failed: %s", exc, exc_info=True
         )
         raise
 
@@ -403,7 +436,7 @@ async def mark_link_sent(meeting_id: int) -> None:
             )
     except Exception as exc:
         logger.error(
-            "[ERROR] [database] mark_link_sent failed — meeting_id: %d, error: %s",
+            "mark_link_sent failed — meeting_id: %d, error: %s",
             meeting_id,
             exc,
             exc_info=True,
@@ -435,7 +468,7 @@ async def store_voice_note(audio_bytes: bytes, mime_type: str, company_id: int) 
             )
         audio_id = row["id"]
         logger.info(
-            "[INFO] [database] Voice note stored — id: %s, size_bytes: %d, mime: %s",
+            "Voice note stored — id: %s, size_bytes: %d, mime: %s",
             audio_id[:8] + "...",
             len(audio_bytes),
             mime_type,
@@ -443,7 +476,7 @@ async def store_voice_note(audio_bytes: bytes, mime_type: str, company_id: int) 
         return audio_id
     except Exception as exc:
         logger.error(
-            "[ERROR] [database] store_voice_note failed — mime: %s, error: %s",
+            "store_voice_note failed — mime: %s, error: %s",
             mime_type,
             exc,
             exc_info=True,
@@ -463,12 +496,12 @@ async def get_voice_note(audio_id: str) -> dict | None:
                 audio_id,
             )
         if row is None:
-            logger.warning("[WARN] [database] Voice note not found — id: %s", audio_id)
+            logger.warning("Voice note not found — id: %s", audio_id)
             return None
         return {"audio_data": bytes(row["audio_data"]), "mime_type": row["mime_type"]}
     except Exception as exc:
         logger.error(
-            "[ERROR] [database] get_voice_note failed — id: %s, error: %s",
+            "get_voice_note failed — id: %s, error: %s",
             audio_id,
             exc,
             exc_info=True,
@@ -499,7 +532,7 @@ async def auto_capture_contact(customer_phone: str, company_id: int = 1) -> None
             )
     except Exception as exc:
         logger.error(
-            "[ERROR] [database] auto_capture_contact failed: %s", exc, exc_info=True
+            "auto_capture_contact failed: %s", exc, exc_info=True
         )
         # Non-fatal — don't raise, just log.
 
@@ -530,9 +563,9 @@ async def create_escalation(customer_phone: str, escalation_reason: str, company
                 escalation_reason,
                 company_id,
             )
-        logger.info("[INFO] [database] Escalation created/updated — company_id: %d", company_id)
+        logger.info("Escalation created/updated — company_id: %d", company_id)
     except Exception as exc:
         logger.error(
-            "[ERROR] [database] create_escalation failed: %s", exc, exc_info=True
+            "create_escalation failed: %s", exc, exc_info=True
         )
         raise
