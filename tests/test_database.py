@@ -3,6 +3,7 @@ test_database.py — Tests for database.py helpers.
 """
 
 import pytest
+from unittest.mock import AsyncMock, call
 
 import database
 
@@ -139,3 +140,44 @@ class TestGetCompanyAppUrl:
         await database.get_company_app_url(42)
         call_args = mock_conn.fetchrow.call_args
         assert 42 in call_args.args
+
+
+class TestAutoCapturContact:
+    async def test_inserts_contact_then_links_to_company(self, mock_conn):
+        """Two-step: INSERT contacts RETURNING id, then INSERT contact_companies."""
+        mock_conn.fetchrow.return_value = {"id": 99}
+        await database.auto_capture_contact("971501234567", company_id=2)
+
+        # Step 1: fetchrow for the contacts upsert (returns id)
+        fetchrow_sql = mock_conn.fetchrow.call_args.args[0]
+        assert "contacts" in fetchrow_sql.lower()
+        assert "phone_number" in fetchrow_sql.lower()
+        assert "company_id" not in fetchrow_sql.lower()
+
+        # Step 2: execute for contact_companies link
+        execute_sql = mock_conn.execute.call_args.args[0]
+        assert "contact_companies" in execute_sql.lower()
+        execute_args = mock_conn.execute.call_args.args
+        assert 99 in execute_args   # contact_id
+        assert 2 in execute_args    # company_id
+
+    async def test_passes_company_id_to_contact_companies(self, mock_conn):
+        """company_id must flow into contact_companies, not contacts."""
+        mock_conn.fetchrow.return_value = {"id": 7}
+        await database.auto_capture_contact("971500000001", company_id=5)
+        execute_args = mock_conn.execute.call_args.args
+        assert 5 in execute_args
+
+    async def test_does_not_raise_on_db_error(self, mock_conn):
+        """Errors are caught and logged — never raised to the caller."""
+        mock_conn.fetchrow.side_effect = RuntimeError("db down")
+        # Must not raise
+        await database.auto_capture_contact("971500000002", company_id=1)
+
+    async def test_on_conflict_clause_present_for_contact_companies(self, mock_conn):
+        """The contact_companies INSERT must include ON CONFLICT DO NOTHING."""
+        mock_conn.fetchrow.return_value = {"id": 1}
+        await database.auto_capture_contact("971500000003", company_id=1)
+        execute_sql = mock_conn.execute.call_args.args[0].lower()
+        assert "on conflict" in execute_sql
+        assert "do nothing" in execute_sql

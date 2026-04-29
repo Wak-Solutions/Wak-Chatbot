@@ -23,7 +23,7 @@ import menu as menu_nav
 from config import DASHBOARD_URL, OPENAI_API_KEY, OPENAI_MODEL
 from intent import ai_scheduling_manually, wants_escalation, wants_meeting
 from notifications import mask_phone, notify_dashboard
-from prompt import get_system_prompt
+from prompt import detect_language, get_system_prompt
 from tools import TOOLS
 
 logger = logging.getLogger(__name__)
@@ -313,10 +313,16 @@ async def get_reply(
         else new_message
     )
 
+    _lang = detect_language(new_message)
     messages = (
         [{"role": "system", "content": system_content}]
         + history
         + [{"role": "user", "content": _effective_message}]
+        + [{"role": "system", "content": (
+            f"FINAL INSTRUCTION: The customer just wrote in {_lang}. "
+            f"Your response MUST be in {_lang} only. "
+            f"Do not use any other language under any circumstances."
+        )}]
     )
 
     # ── Step 6: First OpenAI call ─────────────────────────────────────────────

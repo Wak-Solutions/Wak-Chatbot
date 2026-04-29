@@ -195,3 +195,56 @@ class TestGetReply:
 
         assert "http://localhost:5000/book/xyz" in reply
         assert "What date" not in reply
+
+
+class TestLanguageEnforcement:
+    """The messages array must end with a language-enforcement system message."""
+
+    def _get_messages_sent(self, mock_openai) -> list:
+        """Extract the messages list from the first OpenAI call."""
+        return mock_openai.chat.completions.create.call_args.kwargs["messages"]
+
+    async def test_english_input_adds_english_enforcement(self, mock_openai, mock_externals):
+        """English customer message → last message enforces English."""
+        from agent import get_reply
+
+        with patch("memory.get_conversation_id", new=AsyncMock(return_value=None)):
+            await get_reply("971501234567", "hello", company_id=1)
+
+        messages = self._get_messages_sent(mock_openai)
+        last = messages[-1]
+        assert last["role"] == "system"
+        assert "English" in last["content"]
+        assert "FINAL INSTRUCTION" in last["content"]
+
+    async def test_arabic_input_adds_arabic_enforcement(self, mock_openai, mock_externals):
+        """Arabic customer message → last message enforces Arabic."""
+        from agent import get_reply
+
+        with patch("memory.get_conversation_id", new=AsyncMock(return_value=None)):
+            await get_reply("971501234567", "مرحبا", company_id=1)
+
+        messages = self._get_messages_sent(mock_openai)
+        last = messages[-1]
+        assert last["role"] == "system"
+        assert "Arabic" in last["content"]
+        assert "FINAL INSTRUCTION" in last["content"]
+
+    async def test_enforcement_message_is_last(self, mock_openai, mock_externals):
+        """The enforcement system message must come after the user message."""
+        from agent import get_reply
+
+        with patch("memory.get_conversation_id", new=AsyncMock(return_value=None)):
+            await get_reply("971501234567", "hello", company_id=1)
+
+        messages = self._get_messages_sent(mock_openai)
+        # Second-to-last must be user, last must be system enforcement
+        assert messages[-2]["role"] == "user"
+        assert messages[-1]["role"] == "system"
+        assert "FINAL INSTRUCTION" in messages[-1]["content"]
+
+    async def test_detect_language_imported_from_prompt(self):
+        """detect_language is re-exported from prompt and available in agent."""
+        import agent
+        from prompt import detect_language
+        assert agent.detect_language is detect_language
