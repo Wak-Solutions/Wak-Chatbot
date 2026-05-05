@@ -102,10 +102,22 @@ class TestDetectLanguage:
         assert detect_language("hello مرحبا") == "Arabic"
 
     def test_empty_string(self):
-        assert detect_language("") == "English"
+        assert detect_language("") is None
+
+    def test_single_digit(self):
+        assert detect_language("2") is None
+
+    def test_multiple_digits(self):
+        assert detect_language("123") is None
+
+    def test_punctuation_only(self):
+        assert detect_language("!") is None
+
+    def test_emoji_only(self):
+        assert detect_language("😊") is None
 
     def test_numbers_and_punctuation(self):
-        assert detect_language("123 !@#") == "English"
+        assert detect_language("123 !@#") is None
 
 
 class TestLanguageOverride:
@@ -125,6 +137,12 @@ class TestLanguageOverride:
     async def test_no_message_no_override(self, mock_conn):
         mock_conn.fetchrow.return_value = {"system_prompt": "Base prompt"}
         result = await get_system_prompt(company_id=1)
+        assert result == "Base prompt"
+        assert "OVERRIDE" not in result
+
+    async def test_digits_only_no_override(self, mock_conn):
+        mock_conn.fetchrow.return_value = {"system_prompt": "Base prompt"}
+        result = await get_system_prompt(company_id=1, current_message="2")
         assert result == "Base prompt"
         assert "OVERRIDE" not in result
 

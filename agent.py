@@ -1,159 +1,27 @@
-"""
-agent.py — OpenAI orchestration for the WAK WhatsApp bot.
+"""agent.py — public entry point that orchestrates a full inbound→reply OpenAI turn."""
 
-Single responsibility: take a customer message, call OpenAI (with optional
-tool use), and return the final reply text. All other concerns live in
-dedicated modules:
-
-  intent.py       — keyword detection (wants_meeting, wants_escalation, …)
-  prompt.py       — system prompt loading + cache
-  tools.py        — OpenAI tool schema definitions
-  notifications.py — fire-and-forget dashboard notifications
-"""
-
-import json
 import logging
-
-import httpx
-import openai
+import re
 
 import database
 import memory
 import menu as menu_nav
-from config import DASHBOARD_URL, OPENAI_API_KEY, OPENAI_MODEL
+from config import OPENAI_MODEL
 from intent import ai_scheduling_manually, wants_escalation, wants_meeting
 from notifications import mask_phone, notify_dashboard
-from prompt import detect_language, get_system_prompt
-from tools import TOOLS
+from prompt import detect_language
+
+# Re-exports — kept at module top level so tests can patch via `agent.<name>`.
+from _agent_utils import (
+    client,
+    normalise_menu_numbers,
+    set_http_client,
+)
+from _agent_booking import _resolve_booking_url
+from _agent_messages import build_messages
+from _agent_openai import run_openai_turn, _OpenAITimeout
 
 logger = logging.getLogger(__name__)
-
-# Reused for every call — no need to recreate on each request.
-client = openai.AsyncOpenAI(api_key=OPENAI_API_KEY)
-
-# Shared HTTP client injected by main.py lifespan.
-_http_client: httpx.AsyncClient | None = None
-
-
-def set_http_client(http_client: httpx.AsyncClient) -> None:
-    global _http_client
-    _http_client = http_client
-
-
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
-
-
-async def _resolve_booking_url(
-    customer_phone: str,
-    pending_meeting: dict | None,
-    company_id: int,
-) -> str | None:
-    """
-    Return a booking URL for the customer.
-
-    Reuses an existing unbooked meeting token if one exists, otherwise
-    creates a fresh token via the dashboard API. Returns None on failure.
-    """
-    # Use a Postgres advisory lock keyed on (company_id, customer_phone) to
-    # prevent two concurrent webhook deliveries from both creating a token.
-    # SELECT FOR UPDATE only locks existing rows — it does not prevent a race
-    # when the result set is empty. pg_try_advisory_xact_lock is non-blocking:
-    # if another instance holds the lock, we re-query for its token instead.
-    conn = await database.pool.acquire()
-    try:
-        async with conn.transaction():
-            lock_key = hash((company_id, customer_phone)) & 0x7FFFFFFFFFFFFFFF
-            acquired = await conn.fetchval(
-                "SELECT pg_try_advisory_xact_lock($1)", lock_key
-            )
-            if not acquired:
-                # Another instance is mid-creation — return its token if ready.
-                row = await conn.fetchrow(
-                    """
-                    SELECT meeting_token FROM meetings
-                    WHERE customer_phone = $1
-                      AND company_id     = $2
-                      AND status         = 'pending'
-                      AND scheduled_at   IS NULL
-                      AND created_at     >= NOW() - INTERVAL '5 minutes'
-                    ORDER BY created_at DESC LIMIT 1
-                    """,
-                    customer_phone,
-                    company_id,
-                )
-                if row and row["meeting_token"]:
-                    logger.info(
-                        "Advisory lock missed — reusing token — phone: %s",
-                        mask_phone(customer_phone),
-                    )
-                    return f"{DASHBOARD_URL}/book/{row['meeting_token']}"
-                return None
-
-            # Lock acquired — check for an existing token first.
-            row = await conn.fetchrow(
-                """
-                SELECT meeting_token FROM meetings
-                WHERE customer_phone = $1
-                  AND company_id     = $2
-                  AND status         = 'pending'
-                  AND scheduled_at   IS NULL
-                  AND created_at     >= NOW() - INTERVAL '5 minutes'
-                ORDER BY created_at DESC LIMIT 1
-                """,
-                customer_phone,
-                company_id,
-            )
-            if row and row["meeting_token"]:
-                logger.info(
-                    "Reusing existing meeting token — phone: %s",
-                    mask_phone(customer_phone),
-                )
-                return f"{DASHBOARD_URL}/book/{row['meeting_token']}"
-
-            # No existing token — create one now.
-            try:
-                secret = await database.get_webhook_secret_by_company_id(company_id)
-                if not secret:
-                    logger.error(
-                        "create-token — no webhook secret for company_id=%d",
-                        company_id,
-                    )
-                    return None
-                _http = _http_client or httpx.AsyncClient(timeout=10.0)
-                _is_temp = _http_client is None
-                try:
-                    resp = await _http.post(
-                        f"{DASHBOARD_URL}/api/meetings/create-token",
-                        json={"customer_phone": customer_phone},
-                        headers={"x-webhook-secret": secret},
-                        timeout=10.0,
-                    )
-                    resp.raise_for_status()
-                    token = resp.json()["token"]
-                    logger.info(
-                        "Meeting token created — phone: %s",
-                        mask_phone(customer_phone),
-                    )
-                    return f"{DASHBOARD_URL}/book/{token}"
-                finally:
-                    if _is_temp:
-                        await _http.aclose()
-            except Exception as exc:
-                logger.error(
-                    "create-token failed — phone: %s, error: %s",
-                    mask_phone(customer_phone),
-                    exc,
-                )
-                return None
-    finally:
-        await database.pool.release(conn)
-
-
-# ---------------------------------------------------------------------------
-# Main entry point
-# ---------------------------------------------------------------------------
 
 
 async def get_reply(
@@ -163,34 +31,7 @@ async def get_reply(
     _save_inbound: bool = True,
     company_id: int = 1,
 ) -> tuple[str, str | None]:
-    """
-    Main entry point called by main.py for every incoming WhatsApp message.
-
-    Flow:
-        1. Load conversation history from the messages table.
-        2. Notify dashboard of the inbound message.
-        3. Check for escalation intent — notify dashboard immediately if found.
-        4. Check for meeting intent — short-circuit with booking URL if found.
-        5. Build the OpenAI message list (system + history + new message).
-        6. First OpenAI call (with tool_choice="auto").
-        7. If OpenAI requests a tool — run it, then make a second OpenAI call.
-        8. Safety nets: replace [BOOKING_LINK] placeholder, override manual
-           scheduling attempts.
-        9. Save the exchange to memory.
-       10. Return (final_reply, None).
-
-    Args:
-        customer_phone:  The customer's WhatsApp number, e.g. "971501234567".
-        new_message:     The text the customer just sent (or Whisper transcription).
-        _save_inbound:   If False, skip saving the inbound message here.
-                         Set to False when the caller (process_audio_message) has
-                         already saved it with richer metadata (media_url, etc.).
-        company_id:      The company owning this WhatsApp number.
-
-    Returns:
-        (reply_text, meeting_message) — meeting_message is always None now;
-        kept for backward compat with main.py callers.
-    """
+    """Take a customer message, run the full OpenAI orchestration, return (reply, None)."""
     # ── Step 1: Load history ──────────────────────────────────────────────────
     history = await memory.load_history(customer_phone, company_id)
 
@@ -203,16 +44,13 @@ async def get_reply(
     )
 
     # ── Step 2a: Deterministic menu navigation ────────────────────────────────
-    # Get the active conversation_id (None for brand-new customers).
     _conv_id = await memory.get_conversation_id(customer_phone, company_id)
 
-    # Check if the customer is navigating the menu tree.
     _menu_reply, _leaf_selection = await menu_nav.handle(
         customer_phone, company_id, new_message, _conv_id or ""
     )
 
     if _menu_reply is not None:
-        # Mid-tree: send the next level's numbered options directly — no LLM needed.
         if _save_inbound:
             await memory.save_message(
                 customer_phone=customer_phone,
@@ -220,15 +58,11 @@ async def get_reply(
                 message_text=new_message,
                 company_id=company_id,
             )
-        # Outbound is persisted by main.py AFTER whatsapp.send_message succeeds,
-        # so a failed Meta send does not leave a ghost message in the dashboard.
         logger.info(
             "Menu level sent — phone: %s",
             mask_phone(customer_phone),
         )
         return _menu_reply, None
-    # _leaf_selection is a breadcrumb string when a leaf was reached; the LLM
-    # will handle the response with that context injected below.
 
     # ── Step 3: Human-agent request check ────────────────────────────────────
     if wants_escalation(new_message, history):
@@ -259,7 +93,6 @@ async def get_reply(
                     message_text=new_message,
                     company_id=company_id,
                 )
-            # Outbound persisted by main.py after successful send.
             logger.info(
                 "Booking link sent — phone: %s",
                 mask_phone(customer_phone),
@@ -267,65 +100,16 @@ async def get_reply(
             return booking_reply, None
 
     # ── Step 5: Build message list ────────────────────────────────────────────
-    system_content = await get_system_prompt(company_id, current_message=new_message)
-
-    # Append a menu-navigation override so OpenAI only ever shows the top-level
-    # items — sub-levels are handled deterministically by menu_nav.handle().
-    _top_menu = await menu_nav.format_top_level(company_id)
-    if _top_menu:
-        system_content += (
-            "\n\nMENU NAVIGATION RULE (overrides the MAIN MENU section above):\n"
-            "When presenting the service menu, display ONLY the top-level options "
-            "listed below — NEVER show sub-items. The customer selects by number and "
-            "the sub-options are delivered automatically.\n"
-            + _top_menu
-            + "\nWait for the customer to reply with a number before going deeper."
-        )
-
-    # Inject a real booking URL into the system prompt so OpenAI never
-    # invents a fake one. If no pending token exists, instruct OpenAI to
-    # output a known placeholder that we catch and replace below.
-    _injected_booking_url = None
-    if pending_meeting and pending_meeting.get("scheduled_at") is None:
-        _t = pending_meeting.get("meeting_token")
-        if _t:
-            _injected_booking_url = f"{DASHBOARD_URL}/book/{_t}"
-
-    if _injected_booking_url:
-        system_content += (
-            f"\n\nBOOKING URL: {_injected_booking_url}\n"
-            "When sending the customer a meeting/booking link, use this exact URL. "
-            "Do NOT invent, shorten, or modify it."
-        )
-    else:
-        system_content += (
-            "\n\nWhen sending the customer a meeting/booking link, output the literal "
-            "text [BOOKING_LINK] as a placeholder — it will be replaced automatically. "
-            "Do NOT invent a URL."
-        )
-
-    # When the customer just reached a leaf node in the menu tree, replace the
-    # bare number they sent with a meaningful description so OpenAI can respond
-    # correctly without seeing the full navigation history.
-    _effective_message = (
-        f"I'd like to enquire about: {_leaf_selection}"
-        if _leaf_selection
-        else new_message
+    messages = await build_messages(
+        customer_phone=customer_phone,
+        new_message=new_message,
+        history=history,
+        pending_meeting=pending_meeting,
+        leaf_selection=_leaf_selection,
+        company_id=company_id,
     )
 
-    _lang = detect_language(new_message)
-    messages = (
-        [{"role": "system", "content": system_content}]
-        + history
-        + [{"role": "user", "content": _effective_message}]
-        + [{"role": "system", "content": (
-            f"FINAL INSTRUCTION: The customer just wrote in {_lang}. "
-            f"Your response MUST be in {_lang} only. "
-            f"Do not use any other language under any circumstances."
-        )}]
-    )
-
-    # ── Step 6: First OpenAI call ─────────────────────────────────────────────
+    # ── Step 6+7: OpenAI call (with tool dispatch) ────────────────────────────
     logger.info(
         "OpenAI request — model: %s, history_len: %d, phone: %s",
         OPENAI_MODEL,
@@ -334,100 +118,9 @@ async def get_reply(
     )
 
     try:
-        response = await client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=messages,
-            tools=TOOLS,
-            tool_choice="auto",
-            timeout=30.0,
-        )
-    except openai.APITimeoutError:
-        logger.error(
-            "OpenAI timeout — model: %s, phone: %s",
-            OPENAI_MODEL,
-            mask_phone(customer_phone),
-        )
-        return "I'm taking too long to respond. Please try again in a moment."
-
-    usage = response.usage
-    logger.info(
-        "OpenAI response — model: %s, prompt_tokens: %s, completion_tokens: %s, phone: %s",
-        OPENAI_MODEL,
-        usage.prompt_tokens if usage else "n/a",
-        usage.completion_tokens if usage else "n/a",
-        mask_phone(customer_phone),
-    )
-
-    response_message = response.choices[0].message
-
-    # ── Step 7: Tool call handling ────────────────────────────────────────────
-    if response_message.tool_calls:
-        # Append the assistant message once (contains all tool_calls)
-        messages.append(response_message)
-        for tool_call in response_message.tool_calls:
-            function_name = tool_call.function.name
-            function_args = json.loads(tool_call.function.arguments)
-
-            logger.info(
-                "Tool call — function: %s, phone: %s",
-                function_name,
-                mask_phone(customer_phone),
-            )
-
-            if function_name == "lookup_order":
-                try:
-                    tool_result = await database.lookup_order(
-                        order_number=function_args["order_number"],
-                        company_id=company_id,
-                    )
-                except Exception as _lookup_exc:
-                    logger.warning(
-                        "lookup_order failed — phone: %s, error: %s",
-                        mask_phone(customer_phone),
-                        _lookup_exc,
-                    )
-                    tool_result = {"error": "Order lookup temporarily unavailable. Please try again."}
-            else:
-                logger.warning(
-                    "Unknown tool requested — function: %s", function_name
-                )
-                tool_result = {"error": f"Unknown tool: {function_name}"}
-
-            messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "content": json.dumps(tool_result),
-                }
-            )
-
-        # Second OpenAI call with the tool result included.
-        try:
-            second_response = await client.chat.completions.create(
-                model=OPENAI_MODEL,
-                messages=messages,
-                tools=TOOLS,
-                tool_choice="auto",
-                timeout=30.0,
-            )
-        except openai.APITimeoutError:
-            logger.error(
-                "OpenAI tool-followup timeout — model: %s, phone: %s",
-                OPENAI_MODEL,
-                mask_phone(customer_phone),
-            )
-            return "I'm taking too long to respond. Please try again in a moment."
-        second_usage = second_response.usage
-        logger.info(
-            "OpenAI tool-follow-up — model: %s, prompt_tokens: %s, completion_tokens: %s, phone: %s",
-            OPENAI_MODEL,
-            second_usage.prompt_tokens if second_usage else "n/a",
-            second_usage.completion_tokens if second_usage else "n/a",
-            mask_phone(customer_phone),
-        )
-        final_reply = second_response.choices[0].message.content
-    else:
-        final_reply = response_message.content
+        final_reply = await run_openai_turn(client, messages, customer_phone, company_id)
+    except _OpenAITimeout as exc:
+        return exc.fallback
 
     # ── Step 8: Safety nets ───────────────────────────────────────────────────
 
@@ -458,8 +151,6 @@ async def get_reply(
             )
 
     # ── Step 9: Save inbound only ─────────────────────────────────────────────
-    # Outbound is persisted by main.py after whatsapp.send_message succeeds,
-    # so a Meta send failure doesn't leave a ghost reply in the dashboard.
     if _save_inbound:
         await memory.save_message(
             customer_phone=customer_phone,
@@ -469,13 +160,11 @@ async def get_reply(
         )
 
     # ── Step 10: (Re)initialise menu navigation for the next message ──────────
-    # Only reset menu state when the bot itself presented a numbered list.
-    # Resetting unconditionally caused "1 question about pricing" to be
-    # intercepted by the menu handler instead of going to the LLM.
-    import re as _re
-    if final_reply and _re.search(r"^\d+[\.\)]", final_reply, _re.MULTILINE):
+    if final_reply and re.search(r"^\d+[\.\)]", final_reply, re.MULTILINE):
         _post_conv_id = await memory.get_conversation_id(customer_phone, company_id)
         if _post_conv_id:
             await menu_nav.start(customer_phone, company_id, _post_conv_id)
 
+    if final_reply:
+        final_reply = normalise_menu_numbers(final_reply)
     return final_reply, None

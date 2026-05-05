@@ -1,8 +1,4 @@
-"""
-notifications.py — fire-and-forget HTTP notifications to the dashboard.
-
-Keeps agent.py and main.py free of cross-service HTTP concerns.
-"""
+"""notifications.py — fire-and-forget HTTP notifications to the dashboard."""
 
 import logging
 
@@ -10,6 +6,7 @@ import httpx
 
 import database
 from config import DASHBOARD_URL
+from phone_utils import mask_phone  # re-exported for back-compat with existing callers
 
 logger = logging.getLogger(__name__)
 
@@ -19,13 +16,6 @@ _http_client: httpx.AsyncClient | None = None
 def set_client(client: httpx.AsyncClient) -> None:
     global _http_client
     _http_client = client
-
-
-def mask_phone(phone: str) -> str:
-    """Return phone number with only last 4 digits visible for safe logging."""
-    if not phone or len(phone) < 4:
-        return "****"
-    return f"****{phone[-4:]}"
 
 
 async def notify_dashboard(

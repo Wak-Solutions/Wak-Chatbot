@@ -248,3 +248,41 @@ class TestLanguageEnforcement:
         import agent
         from prompt import detect_language
         assert agent.detect_language is detect_language
+
+
+class TestNormaliseMenuNumbers:
+    def _fn(self):
+        from agent import normalise_menu_numbers
+        return normalise_menu_numbers
+
+    def test_arabic_indic_single(self):
+        assert self._fn()("١. خيار") == "1. خيار"
+
+    def test_arabic_indic_two(self):
+        assert self._fn()("٢. خيار") == "2. خيار"
+
+    def test_letter_marker_a(self):
+        assert self._fn()("A. Option") == "1. Option"
+
+    def test_letter_marker_b(self):
+        lines = "A. First\nB. Second"
+        assert self._fn()(lines) == "1. First\n2. Second"
+
+    def test_already_western_unchanged(self):
+        assert self._fn()("1. Already correct") == "1. Already correct"
+
+    def test_arabic_text_no_list_unchanged(self):
+        text = "مرحبا كيف حالك"
+        assert self._fn()(text) == text
+
+    def test_mixed_arabic_indic_list(self):
+        lines = "١. الأول\n٢. الثاني\n٣. الثالث"
+        assert self._fn()(lines) == "1. الأول\n2. الثاني\n3. الثالث"
+
+    def test_paren_variant(self):
+        assert self._fn()("A) Option") == "1) Option"
+
+    def test_counter_resets_between_lists(self):
+        lines = "A. First\nSome text\nA. Again"
+        result = self._fn()(lines)
+        assert result == "1. First\nSome text\n1. Again"

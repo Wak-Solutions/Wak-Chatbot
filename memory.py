@@ -156,24 +156,24 @@ async def save_message(
                 )
                 conversation_id = str(row["conversation_id"]) if row else str(uuid.uuid4())
 
-            await conn.execute(
-                """
-                INSERT INTO messages
-                  (customer_phone, direction, sender, message_text,
-                   media_type, media_url, transcription, company_id, created_at,
-                   conversation_id)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), $9::uuid)
-                """,
-                customer_phone,
-                direction,
-                sender,
-                message_text,
-                media_type,
-                media_url,
-                transcription,
-                company_id,
-                conversation_id,
-            )
+                await conn.execute(
+                    """
+                    INSERT INTO messages
+                      (customer_phone, direction, sender, message_text,
+                       media_type, media_url, transcription, company_id, created_at,
+                       conversation_id)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), $9::uuid)
+                    """,
+                    customer_phone,
+                    direction,
+                    sender,
+                    message_text,
+                    media_type,
+                    media_url,
+                    transcription,
+                    company_id,
+                    conversation_id,
+                )
         logger.info(
             "Message saved — phone: %s, direction: %s, sender: %s, media_type: %s",
             _mask_phone(customer_phone),
