@@ -79,14 +79,14 @@ async def get_company_by_phone_number_id(phone_number_id: str) -> int | None:
             row = await conn.fetchrow(
                 """
                 SELECT id FROM companies
-                WHERE whatsapp_phone_number_id = $1
+                WHERE whatsapp_phone_number_id = $1 AND is_active = true
                 LIMIT 1
                 """,
                 phone_number_id,
             )
         if not row:
             logger.error(
-                "Unroutable webhook — no company owns phone_number_id=%s. "
+                "Unroutable webhook — no active company owns phone_number_id=%s. "
                 "Message will be discarded. Register this number in the company's WhatsApp settings.",
                 phone_number_id,
             )

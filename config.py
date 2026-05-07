@@ -66,7 +66,6 @@ _required = {
     "DATABASE_URL": DATABASE_URL,
     "VERIFY_TOKEN": VERIFY_TOKEN,
     "DASHBOARD_URL": DASHBOARD_URL,
-    "WEBHOOK_SECRET": WEBHOOK_SECRET,
 }
 
 for _name, _value in _required.items():

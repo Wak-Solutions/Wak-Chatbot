@@ -21,7 +21,16 @@ router = APIRouter()
 
 @router.get("/webhook")
 async def verify_webhook(request: Request):
-    """Meta webhook verification endpoint."""
+    """
+    Meta webhook verification endpoint (GET handshake).
+
+    SECURITY NOTE (FINAL-032): Meta's webhook model registers one callback URL
+    with one verify_token per Meta App — the GET handshake carries no
+    phone_number_id, so per-tenant verify tokens are not feasible. This single
+    global VERIFY_TOKEN is intentional. Ensure it is a strong unique value
+    (≥32 chars, not shared with other secrets) and is rotated if compromised.
+    VERIFY_TOKEN is validated at startup and the server refuses to start without it.
+    """
     params = request.query_params
     mode = params.get("hub.mode")
     token = params.get("hub.verify_token")
@@ -61,15 +70,29 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks):
         _value = _changes[0].get("value", {}) if _changes else {}
         _pnid = _value.get("metadata", {}).get("phone_number_id", "")
     except Exception:
+        # SECURITY NOTE (FINAL-035): Malformed JSON is returned as 200 OK rather
+        # than 400. This is intentional — a non-200 response causes Meta to retry
+        # the same payload repeatedly, flooding the server. Since we cannot verify
+        # the signature of a body we cannot parse, no processing occurs; returning
+        # 200 silently drops the unverifiable request without triggering retries.
         logger.warning("Webhook POST dropped — malformed JSON body")
         return JSONResponse(content={"status": "ok"}, status_code=200)
 
     if not _pnid:
+        # SECURITY NOTE (FINAL-035 cont.): A missing phone_number_id means we
+        # cannot look up the app_secret and therefore cannot verify the signature.
+        # We return 200 for the same Meta-retry reason above. The body is never
+        # processed — this branch covers status-update callbacks that carry no
+        # message payload (e.g. delivery receipts without a phone_number_id).
         logger.info("Webhook with no phone_number_id — likely a status update, accepting")
         return JSONResponse(content={"status": "ok"}, status_code=200)
 
     app_secret = await database.get_app_secret_by_phone_number_id(_pnid)
     if not app_secret:
+        # SECURITY NOTE (FINAL-033): Fail-closed. A NULL or empty app_secret
+        # (DB miss or unset column) returns 403 — there is no fallback to an empty
+        # string or default secret. HMAC computation only proceeds when a non-empty
+        # app_secret is confirmed for the specific phone_number_id.
         logger.warning(
             "Webhook POST rejected — no app_secret registered for phone_number_id=%s",
             _pnid,
@@ -165,7 +188,7 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks):
                 msg_type,
             )
 
-    except (IndexError, KeyError, TypeError) as exc:
-        logger.error("Failed to parse webhook payload: %s", exc, exc_info=True)
+    except Exception as exc:
+        logger.error("Failed to process webhook payload: %s", exc, exc_info=True)
 
     return JSONResponse(content={"status": "ok"}, status_code=200)

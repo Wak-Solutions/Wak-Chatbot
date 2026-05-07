@@ -8,3 +8,9 @@ __pycache__/
 
 # Mac OS system file — not needed in repo
 .DS_Store
+
+# Python virtualenv
+venv/
+
+# Coverage data
+.coverage

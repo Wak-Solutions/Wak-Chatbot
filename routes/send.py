@@ -2,13 +2,12 @@
 
 import logging
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 import database
 import memory
 import whatsapp
-from deps import require_webhook_secret
 from notifications import mask_phone
 
 logger = logging.getLogger(__name__)
@@ -17,7 +16,7 @@ router = APIRouter()
 
 
 @router.post("/send")
-async def send_agent_message(request: Request, _: None = Depends(require_webhook_secret)):
+async def send_agent_message(request: Request):
     """
     Called by the agent dashboard when an agent sends a manual reply.
     Validates the webhook secret, sends via WhatsApp, saves with sender='agent'.

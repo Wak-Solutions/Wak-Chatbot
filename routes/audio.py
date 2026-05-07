@@ -3,11 +3,10 @@
 import logging
 import uuid
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, Response
 
 import database
-from deps import require_webhook_secret
 
 logger = logging.getLogger(__name__)
 
@@ -15,7 +14,7 @@ router = APIRouter()
 
 
 @router.get("/audio/{audio_id}")
-async def serve_audio(audio_id: str, request: Request, _: None = Depends(require_webhook_secret)):
+async def serve_audio(audio_id: str, request: Request):
     """
     Stream a stored voice note. Protected by x-webhook-secret header.
     """

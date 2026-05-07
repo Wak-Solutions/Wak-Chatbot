@@ -1,4 +1,10 @@
-"""_db_voice_notes.py — voice note storage and retrieval queries."""
+"""_db_voice_notes.py — voice note storage and retrieval queries.
+
+CR-017 NOTE: Voice notes are stored as BYTEA in Postgres (voice_notes.audio_data).
+This is acceptable for low-to-medium volume. For high volume, migrate to S3/object
+storage with presigned URLs and a scheduled cleanup job. The interface (store/get)
+is intentionally narrow so the storage backend can be swapped without touching callers.
+"""
 
 import logging
 

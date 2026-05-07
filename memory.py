@@ -13,8 +13,10 @@ logger = logging.getLogger(__name__)
 
 # Process-scoped set keyed by "{company_id}:{phone}".
 # Avoids a DB round-trip for the ON CONFLICT DO NOTHING upsert on every inbound message.
-# Resets on process restart — the DB upsert handles that case correctly.
+# Capped at _KNOWN_CONTACTS_MAX entries; clears when full (the DB upsert is idempotent,
+# so a cache miss only costs one extra ON CONFLICT DO NOTHING query).
 _known_contacts: set[str] = set()
+_KNOWN_CONTACTS_MAX = 50_000
 
 
 async def load_history(customer_phone: str, company_id: int = 1) -> list[dict]:
@@ -197,4 +199,6 @@ async def save_message(
         _key = f"{company_id}:{customer_phone}"
         if _key not in _known_contacts:
             await database.auto_capture_contact(customer_phone, company_id)
+            if len(_known_contacts) >= _KNOWN_CONTACTS_MAX:
+                _known_contacts.clear()
             _known_contacts.add(_key)
