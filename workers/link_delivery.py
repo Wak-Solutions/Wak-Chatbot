@@ -32,7 +32,7 @@ async def _link_delivery_loop():
                     if m.get("meeting_token")
                     else m["meeting_link"]
                 )
-                msg = f"Your meeting is starting soon! Join here: {meeting_url}"
+                msg = f"Reminder: your meeting starts in 15 minutes.\nJoin here: {meeting_url}"
                 _creds = await database.get_company_whatsapp_creds(m["company_id"])
                 if _creds is None:
                     logger.error(
