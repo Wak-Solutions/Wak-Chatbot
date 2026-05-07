@@ -68,13 +68,14 @@ async def handle(
 
     Returns (reply, leaf_label):
       reply       — Text to send the customer, or None if not in menu mode.
-      leaf_label  — Breadcrumb of the final selection when a leaf is reached
-                    (e.g. "Product Inquiry > AI Services > Market Pulse"), or None.
+      leaf_label  — Always None now. (Previously set when a leaf was reached so
+                    the LLM could compose a follow-up; that path has been
+                    replaced by a deterministic 1/2 next-step menu emitted
+                    directly from this function.)
 
     Caller logic:
-      - reply is not None, leaf_label is None  → send reply, done (mid-tree level)
-      - reply is None,     leaf_label is set   → leaf reached; pass label to OpenAI
-      - reply is None,     leaf_label is None  → not in menu mode; use normal OpenAI path
+      - reply is not None  → send reply, done (mid-tree level OR leaf reached)
+      - reply is None      → not in menu mode; use normal OpenAI path
     """
     items = await _load_menu_config(company_id)
     if not items:
@@ -118,14 +119,24 @@ async def handle(
 
     kids = _children(selected)
     if not kids:
-        # Leaf node — selection complete; hand off to OpenAI
+        # Leaf node — selection complete. Return the next-step menu directly;
+        # the LLM is intentionally bypassed for this turn so the customer sees
+        # the deterministic 1/2 menu instead of a model-generated dead-end
+        # message. The deterministic 1/2 router in agent.py picks up the
+        # customer's next "1" or "2" reply and routes it to booking or
+        # human handover without OpenAI.
         clear_state(phone, company_id)
         logger.info(
             "Leaf reached — phone: ...%s, selection: %s",
             phone[-4:],
             breadcrumb,
         )
-        return None, breadcrumb
+        leaf_reply = (
+            f"You selected: {breadcrumb}\n\n"
+            "1. Book a meeting\n"
+            "2. Chat with an agent"
+        )
+        return leaf_reply, None
 
     # Has children — show next level and update state
     _set_state(phone, company_id, _MenuState(path=new_path, conversation_id=conversation_id))
