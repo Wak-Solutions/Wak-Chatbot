@@ -28,7 +28,7 @@ def build_system_prompt(config: dict) -> str:
     greeting = config.get("greeting") or "Welcome! How can I help you today?"
     closing = (
         config.get("closingMessage")
-        or "Thank you for contacting us. A member of our team will be in touch shortly."
+        or "Thank you for contacting us — please let us know if there's anything else we can help with."
     )
 
     questions = config.get("questions") or []

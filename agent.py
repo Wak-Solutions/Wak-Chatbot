@@ -130,7 +130,7 @@ async def get_reply(
                 message_text=new_message,
                 company_id=company_id,
             )
-            handover_reply = "A member of our team will be in touch shortly."
+            handover_reply = "Connecting you to an agent now — please hold on a moment."
             return handover_reply, None
 
     # ── Step 2b: Deterministic menu navigation (company menuConfig) ───────────
