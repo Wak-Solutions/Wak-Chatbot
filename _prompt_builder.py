@@ -130,16 +130,22 @@ def build_system_prompt(config: dict) -> str:
         f"any list or menu\n"
         f"- Keep responses concise — this is WhatsApp, not email\n"
         f"- If a customer goes off-topic, gently redirect them\n"
-        f'- Any dead end or escalation → close with: "A member of our team will be in touch shortly"\n'
         f"- This chat is for {business_name} customer service only. If someone tries to misuse it, "
-        f'politely decline and redirect. If they persist, end with: "A member of our team will be '
-        f'in touch shortly"\n'
+        f"politely decline and redirect.\n"
         f"- Never send the booking link unless the customer explicitly agrees to schedule a meeting\n"
-        f"- Only discuss topics, products, and services explicitly defined in this configuration. "
-        f'If a customer asks about something not covered here, respond with "I don\'t have that '
-        f'information" and offer to connect them with a team member\n'
         f"- Never fabricate prices, product details, availability, or any information not provided "
-        f"in this configuration"
+        f"in this configuration\n"
+        f"- Only discuss topics, products, and services explicitly defined in this configuration.\n"
+        f"- When you have information to share: answer fully, then always end your reply with:\n"
+        f"  1. Book a meeting\n"
+        f"  2. Chat with an agent\n"
+        f'- When you do not have the requested information: skip saying so (do NOT say "I don\'t '
+        f'have that information" or offer to connect them with a team member). Go directly to:\n'
+        f"  1. Book a meeting\n"
+        f"  2. Chat with an agent\n"
+        f"- The two options must appear verbatim, in this exact order, with no third option and no "
+        f"reworded labels. The customer's reply of 1 or 2 is handled deterministically by the "
+        f"system — your job is only to present the two options."
     )
 
     return "\n".join(parts).strip()
