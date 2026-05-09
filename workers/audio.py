@@ -31,7 +31,11 @@ async def process_audio_message(customer_phone: str, media_id: str, mime_type: s
         # Step 1: Download
         try:
             audio_bytes, actual_mime = await transcribe_mod.download_media(media_id, token=creds["token"])
-        except ValueError as exc:
+        except Exception as exc:
+            # CR-013: unified handler so every download failure produces a
+            # user-facing fallback. Sibling except clauses with `raise` would
+            # bypass the general handler, causing silent failure on
+            # ValueError variants like "No CDN URL returned ...".
             if "too large" in str(exc).lower():
                 logger.warning(
                     "Voice note rejected (too large) — phone: %s",
@@ -48,7 +52,21 @@ async def process_audio_message(customer_phone: str, media_id: str, mime_type: s
                     phone_id=creds["phone_id"],
                 )
             else:
-                raise
+                logger.error(
+                    "Voice note download failed — phone: %s, error: %s",
+                    mask_phone(customer_phone),
+                    exc,
+                    exc_info=True,
+                )
+                await whatsapp.send_message(
+                    to=customer_phone,
+                    text=(
+                        "Sorry, I couldn't process your voice message. "
+                        "Could you type your question instead?"
+                    ),
+                    token=creds["token"],
+                    phone_id=creds["phone_id"],
+                )
             return
 
         # Step 2: Store audio in DB

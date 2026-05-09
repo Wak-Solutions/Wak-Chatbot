@@ -19,6 +19,8 @@ async def store_voice_note(audio_bytes: bytes, mime_type: str, company_id: int) 
     import database
     try:
         async with database.pool.acquire() as conn:
+            # TODO CR-017: migrate audio_data from BYTEA to object storage (S3/R2).
+            # BYTEA causes table bloat and loads full blobs into memory on access.
             row = await conn.fetchrow(
                 """
                 INSERT INTO voice_notes (audio_data, mime_type, company_id)

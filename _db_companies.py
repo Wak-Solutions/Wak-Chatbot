@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 # In-process cache: phone_number_id → (company_id, monotonic_timestamp).
 # TTL bounds staleness if a phone_number_id is ever reassigned.
 _company_cache: dict[str, tuple[int, float]] = {}
-_COMPANY_CACHE_TTL = 300.0  # seconds
+_COMPANY_CACHE_TTL = 30.0  # seconds
 _MAX_COMPANY_CACHE = 1_000
 
 
@@ -106,9 +106,9 @@ async def get_company_by_phone_number_id(phone_number_id: str) -> int | None:
         return company_id
     except Exception as exc:
         logger.error(
-            "get_company_by_phone_number_id failed for phone_number_id=%s: %s",
+            "get_company_by_phone_number_id DB error for phone_number_id=%s: %s",
             phone_number_id,
             exc,
             exc_info=True,
         )
-        return None  # do not route to a fallback company on DB error
+        raise

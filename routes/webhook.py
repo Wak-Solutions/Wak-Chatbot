@@ -87,7 +87,20 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks):
         logger.info("Webhook with no phone_number_id — likely a status update, accepting")
         return JSONResponse(content={"status": "ok"}, status_code=200)
 
-    app_secret = await database.get_app_secret_by_phone_number_id(_pnid)
+    try:
+        app_secret = await database.get_app_secret_by_phone_number_id(_pnid)
+    except Exception as exc:
+        # FINAL-024: a DB exception here (e.g., transient Postgres outage) must
+        # NOT bubble up as a 500, because Meta would retry the same webhook
+        # repeatedly and flood the server. Treat it like the malformed-body case:
+        # log, drop, return 200. The customer retries via WhatsApp later.
+        logger.error(
+            "Webhook POST dropped — DB lookup failed for phone_number_id=%s, error: %s",
+            _pnid,
+            exc,
+            exc_info=True,
+        )
+        return JSONResponse(content={"status": "ok"}, status_code=200)
     if not app_secret:
         # SECURITY NOTE (FINAL-033): Fail-closed. A NULL or empty app_secret
         # (DB miss or unset column) returns 403 — there is no fallback to an empty
@@ -126,7 +139,16 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks):
             return JSONResponse(content={"status": "ok"}, status_code=200)
 
         phone_number_id = value.get("metadata", {}).get("phone_number_id", "")
-        company_id = await database.get_company_by_phone_number_id(phone_number_id)
+        try:
+            company_id = await database.get_company_by_phone_number_id(phone_number_id)
+        except Exception as exc:
+            logger.error(
+                "Webhook POST — DB lookup failed for phone_number_id=%s, error: %s",
+                phone_number_id,
+                exc,
+                exc_info=True,
+            )
+            return JSONResponse(content={"error": "service_unavailable"}, status_code=503)
         if company_id is None:
             return JSONResponse(content={"status": "unroutable"}, status_code=200)
 

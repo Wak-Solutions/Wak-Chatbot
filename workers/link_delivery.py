@@ -15,8 +15,12 @@ async def _link_delivery_loop():
     Background task that runs every 60 seconds.
     Sends meeting links to customers whose meetings start within 15 minutes.
     """
+    failures = 0
     while True:
-        await asyncio.sleep(60)
+        # Exponential backoff on consecutive failures, capped at 600 s.
+        # Healthy iterations sleep the original 60 s.
+        delay = min(60 * (2 ** failures), 600)
+        await asyncio.sleep(delay)
         try:
             meetings = await database.get_meetings_to_notify()
             for m in meetings:
@@ -47,5 +51,7 @@ async def _link_delivery_loop():
                     mask_phone(m["customer_phone"]),
                     m["id"],
                 )
+            failures = 0
         except Exception as exc:
-            logger.error("Link delivery job error: %s", exc, exc_info=True)
+            failures += 1
+            logger.error("Link delivery job error (failures=%d): %s", failures, exc, exc_info=True)

@@ -129,6 +129,11 @@ async def get_app_secret_by_phone_number_id(phone_number_id: str) -> str | None:
     """
     Returns the Meta App Secret for the company that owns this phone_number_id.
     Used to verify inbound webhook signatures per-company.
+
+    Returns None when no matching row exists. Re-raises on DB/connection
+    errors so callers can distinguish "unknown phone_number_id" (a security
+    event — return 403) from "transient DB failure" (operational — return 200
+    so Meta does not retry the same webhook in a storm).
     """
     import database
     try:
@@ -142,4 +147,4 @@ async def get_app_secret_by_phone_number_id(phone_number_id: str) -> str | None:
         logger.error(
             "get_app_secret_by_phone_number_id failed: %s", exc, exc_info=True,
         )
-        return None
+        raise

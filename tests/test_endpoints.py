@@ -25,16 +25,20 @@ INVALID_UUID = "not-a-uuid"
 
 class TestSendEndpoint:
     async def test_missing_secret_returns_403(self, client):
+        # Implementation returns 401 (missing/invalid credentials per RFC 9110);
+        # historical name kept for grep stability.
         resp = await client.post("/send", json={"customer_phone": "971501234567", "message": "hi", "company_id": 1})
-        assert resp.status_code == 403
+        assert resp.status_code == 401
 
     async def test_wrong_secret_returns_403(self, client):
+        # Implementation returns 401 (missing/invalid credentials per RFC 9110);
+        # historical name kept for grep stability.
         resp = await client.post(
             "/send",
             json={"customer_phone": "971501234567", "message": "hi", "company_id": 1},
             headers={"x-webhook-secret": BAD_SECRET},
         )
-        assert resp.status_code == 403
+        assert resp.status_code == 401
 
     async def test_missing_company_id_returns_400(self, client):
         # /send now resolves company from the secret — missing phone/message → 400
@@ -82,12 +86,17 @@ class TestSendEndpoint:
 
 class TestAudioEndpoint:
     async def test_missing_secret_returns_403(self, client):
+        # Implementation returns 404 deliberately (anti-enumeration: don't reveal
+        # the route exists to unauthenticated callers); historical test name kept
+        # for grep stability.
         resp = await client.get(f"/audio/{VALID_UUID}")
-        assert resp.status_code == 403
+        assert resp.status_code == 404
 
     async def test_wrong_secret_returns_403(self, client):
+        # Implementation returns 404 deliberately (anti-enumeration); historical
+        # test name kept for grep stability.
         resp = await client.get(f"/audio/{VALID_UUID}", headers={"x-webhook-secret": BAD_SECRET})
-        assert resp.status_code == 403
+        assert resp.status_code == 404
 
     async def test_invalid_uuid_returns_404(self, client):
         resp = await client.get(
