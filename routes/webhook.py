@@ -126,6 +126,10 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks):
         return JSONResponse(content={"error": "Forbidden"}, status_code=403)
     # ── End signature verification ────────────────────────────────────
 
+    # Durability: persist the verified raw payload so a crash mid-processing
+    # leaves a replayable record. Best-effort — see _db_inbox.persist_raw_inbound.
+    await database.persist_raw_inbound(_pnid, _prelim)
+
     body = _prelim
 
     try:
@@ -163,10 +167,23 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks):
         message = messages_list[0]
         msg_type = message.get("type")
         customer_phone = message.get("from")
+        message_id = message.get("id")
 
         if not customer_phone:
             logger.warning("Webhook message missing 'from' field — ignoring")
             return JSONResponse(content={"status": "ok"}, status_code=200)
+
+        # Idempotency: skip if Meta has already delivered this message_id.
+        # Meta retries on any non-2xx or timeout; without this guard a single
+        # slow request can produce duplicate replies + duplicate DB rows.
+        if message_id:
+            claimed = await database.try_claim_message_id(message_id)
+            if not claimed:
+                logger.info(
+                    "Duplicate webhook delivery — message_id=%s, skipping",
+                    message_id,
+                )
+                return JSONResponse(content={"status": "ok"}, status_code=200)
 
         if msg_type == "text":
             message_text = message.get("text", {}).get("body")

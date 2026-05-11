@@ -28,6 +28,7 @@ from _db_meetings import (
 from _db_voice_notes import store_voice_note, get_voice_note
 from _db_contacts import auto_capture_contact
 from _db_escalations import create_escalation
+from _db_inbox import try_claim_message_id, persist_raw_inbound
 
 # Holds the pool once created by main.py on startup. Mutated by create_pool().
 pool: asyncpg.Pool | None = None

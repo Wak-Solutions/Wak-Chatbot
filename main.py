@@ -44,14 +44,7 @@ async def lifespan(app: FastAPI):
     transcribe_mod.set_client(http_client)
     agent.set_http_client(http_client)
 
-    # delivery_task = asyncio.create_task(_link_delivery_loop())
-    # logger.info("Meeting link delivery job started")
     yield
-    # delivery_task.cancel()
-    # try:
-    #     await delivery_task
-    # except asyncio.CancelledError:
-    #     pass
     await http_client.aclose()
     logger.info("Shutting down — closing database connection pool")
     await database.close_pool()

@@ -83,6 +83,19 @@ async def get_reply(
     # ── Step 1: Load history ──────────────────────────────────────────────────
     history = await memory.load_history(customer_phone, company_id)
 
+    # ── Step 1a: Persist inbound BEFORE any network call ──────────────────────
+    # Saving here (instead of after OpenAI) guarantees the customer's message
+    # is in conversation history even if OpenAI/notify/menu/booking raises.
+    # Callers that already saved the inbound (e.g. audio worker) pass
+    # _save_inbound=False to avoid a duplicate row.
+    if _save_inbound:
+        await memory.save_message(
+            customer_phone=customer_phone,
+            direction="inbound",
+            message_text=new_message,
+            company_id=company_id,
+        )
+
     # ── Step 2: Notify dashboard (fire-and-forget) ────────────────────────────
     await notify_dashboard(
         event="message",
@@ -98,13 +111,6 @@ async def get_reply(
     # navigator hijack the digit.
     _next_step_choice = _is_next_step_choice(new_message)
     if _next_step_choice is not None and _bot_just_offered_next_step_menu(history):
-        if _save_inbound:
-            await memory.save_message(
-                customer_phone=customer_phone,
-                direction="inbound",
-                message_text=new_message,
-                company_id=company_id,
-            )
         if _next_step_choice == 1:
             pending_meeting = await database.get_pending_meeting(customer_phone, company_id)
             booking_url = await _resolve_booking_url(customer_phone, pending_meeting, company_id)
@@ -141,13 +147,6 @@ async def get_reply(
     )
 
     if _menu_reply is not None:
-        if _save_inbound:
-            await memory.save_message(
-                customer_phone=customer_phone,
-                direction="inbound",
-                message_text=new_message,
-                company_id=company_id,
-            )
         logger.info(
             "Menu level sent — phone: %s",
             mask_phone(customer_phone),
@@ -176,13 +175,6 @@ async def get_reply(
             booking_reply = (
                 f"Here's your personal booking link — valid for 24 hours: {booking_url}"
             )
-            if _save_inbound:
-                await memory.save_message(
-                    customer_phone=customer_phone,
-                    direction="inbound",
-                    message_text=new_message,
-                    company_id=company_id,
-                )
             logger.info(
                 "Booking link sent — phone: %s",
                 mask_phone(customer_phone),
@@ -239,15 +231,6 @@ async def get_reply(
             final_reply = (
                 f"Here's your personal booking link — valid for 24 hours: {override_url}"
             )
-
-    # ── Step 9: Save inbound only ─────────────────────────────────────────────
-    if _save_inbound:
-        await memory.save_message(
-            customer_phone=customer_phone,
-            direction="inbound",
-            message_text=new_message,
-            company_id=company_id,
-        )
 
     # ── Step 10: (Re)initialise menu navigation for the next message ──────────
     # Skip the re-prime if the LLM ended with the global next-step menu —
